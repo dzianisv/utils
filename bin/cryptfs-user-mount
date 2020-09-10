@@ -1,0 +1,6 @@
+#!/bin/sh -e
+NAME=$(basename "$1")
+MOUNTPOINT="/media/$USER/$NAME"
+
+mkdir -p "$MOUNTPOINT"
+exec gocryptfs "$1" "$MOUNTPOINT"

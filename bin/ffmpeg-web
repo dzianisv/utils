@@ -1,0 +1,5 @@
+#!/bin/sh
+set -xe
+out=/tmp/$(basename ${1%.*}).mp4
+ffmpeg -i ${1} -c:v h264 -crf 30 -s 1200x720 ${out}
+notify-send "${out} is ready"

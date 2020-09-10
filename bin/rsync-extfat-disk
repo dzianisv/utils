@@ -1,0 +1,15 @@
+#!/bin/sh
+
+exec rsync \
+	--update \
+	--recursive \
+	--inplace \
+	--no-owner \
+	--no-group \
+	--no-specials \
+	--delete \
+	--compress \
+	--compress-level=1 \
+	--skip-compress="*.jpg,*.jpeg,*.mp4,*.mov" \
+	--progress=status \
+	--noatime $@

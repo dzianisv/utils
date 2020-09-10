@@ -1,0 +1,13 @@
+#!/bin/bash
+set -ex
+
+if [ -z "${FILE}" ]; then
+    exit 1
+fi
+
+if [ ! lsmod | grep "v4l2loopback" &> /dev/null ] ; then
+    # exclusive_caps is required for Chrome
+    sudo modprobe v4l2loopback  exclusive_caps=1 video_nr=10
+fi
+
+exec gst-launch-1.0 filesrc location=${FILE} ! decodebin ! videoconvert ! videoscale ! videoconvert ! v4l2sink device=/dev/video10

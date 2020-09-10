@@ -1,0 +1,49 @@
+#!/bin/sh
+set -e
+CONTAINER_NAME=$1
+
+if [ -z  "$CONTAINER_NAME" ]; then
+    echo "Usage: ENABLE_X=1 ENABLE_VIDEO=1 lxd-open <container name>"
+    exit 1
+fi
+
+PROFILES="default"
+
+if [ -n "$ENABLE_X" ]; then
+    if ! lxc profile show Wayland; then
+        lxc profile create Wayland
+        lxc profile device add Wayland X11 disk path=/tmp/.X11-unix source=/tmp/.X11-unix
+        lxc profile device add Wayland GPU gpu
+        lxc profile device set Wayland GPU gid 44 # vidoe
+    fi
+    PROFILES="$PROFILES,Wayland"
+fi
+
+if [ -n "$ENABLE_VIDEO" ]; then
+    lxc profile create video
+    for dev in /dev/video*; do
+        DEVICE_NAME=$(basename "$dev")
+        lxc profile device add video "$DEVICE_NAME" unix-char path=$dev
+        lxc profile device set video "$DEVICE_NAME" gid 44 # vidoe
+    done
+    PROFILES="$PROFILES,video"
+fi
+
+sudo chmod a+rwx /tmp/.X11-unix
+lxc profile assign "${CONTAINER_NAME}" "$PROFILES"
+
+if ! lxc info "${CONTAINER_NAME}" | grep "Status: Running"; then
+    lxc start "${CONTAINER_NAME}"
+fi
+
+if lxc exec "${CONTAINER_NAME}" -- cat /etc/passwd | grep -e "^$USER:"; then
+    CONTAINER_HOME=/home/$USER
+    CONTAINER_USER=$USER
+else
+    CONTAINER_USER=root
+    CONTAINER_HOME=/root
+fi
+
+lxc file push "${XAUTHORITY}" "${CONTAINER_NAME}/$CONTAINER_HOME/.Xauthority"
+lxc exec "${CONTAINER_NAME}" -- su "$CONTAINER_USER" -c "DISPLAY=:0 bash"
+lxc stop "${CONTAINER_NAME}"
