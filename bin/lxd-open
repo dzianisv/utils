@@ -1,6 +1,7 @@
-#!/bin/sh
-set -e
+#!/bin/bash
+set -xe
 CONTAINER_NAME=$1
+COMMAND=${2:-bash}
 
 if [ -z  "$CONTAINER_NAME" ]; then
     echo "Usage: ENABLE_X=1 ENABLE_VIDEO=1 lxd-open <container name>"
@@ -10,13 +11,15 @@ fi
 PROFILES="default"
 
 if [ -n "$ENABLE_X" ]; then
-    if ! lxc profile show Wayland; then
-        lxc profile create Wayland
-        lxc profile device add Wayland X11 disk path=/tmp/.X11-unix source=/tmp/.X11-unix
-        lxc profile device add Wayland GPU gpu
-        lxc profile device set Wayland GPU gid 44 # vidoe
+    if ! lxc profile show graphic; then
+        lxc profile create graphic
+        lxc profile device add graphic X11 disk path=/host/.X11-unix/ source=/tmp/.X11-unix/
+        lxc profile device add graphic GPU gpu
+        lxc profile device set graphic GPU gid 44 # vidoe
     fi
-    PROFILES="$PROFILES,Wayland"
+
+    sudo chmod a+rwx /tmp/.X11-unix
+    PROFILES="$PROFILES,graphic"
 fi
 
 if [ -n "$ENABLE_VIDEO" ]; then
@@ -29,21 +32,29 @@ if [ -n "$ENABLE_VIDEO" ]; then
     PROFILES="$PROFILES,video"
 fi
 
-sudo chmod a+rwx /tmp/.X11-unix
+if [ -n "$ENABLE_NETFILTER" ]; then
+    if ! lxc profile show netfilter; then
+        lxc profile create netfilter
+        lxc profile set netfilter linux.kernel_modules br_netfilter
+    fi
+    PROFILES="$PROFILES,netfilter"
+fi
+
 lxc profile assign "${CONTAINER_NAME}" "$PROFILES"
 
 if ! lxc info "${CONTAINER_NAME}" | grep "Status: Running"; then
     lxc start "${CONTAINER_NAME}"
+    while [[ ! $(lxc exec "${CONTAINER_NAME}" -- systemctl is-system-running) =~ (degraded)|(running) ]]; do sleep 1; done
 fi
 
-if lxc exec "${CONTAINER_NAME}" -- cat /etc/passwd | grep -e "^$USER:"; then
-    CONTAINER_HOME=/home/$USER
-    CONTAINER_USER=$USER
-else
-    CONTAINER_USER=root
-    CONTAINER_HOME=/root
+if [ -n "$ENABLE_X" ]; then
+    xhost + local:
+    lxc file push "${XAUTHORITY}" "${CONTAINER_NAME}/host/.Xauthority"
+    lxc exec "${CONTAINER_NAME}" -- chmod a+r /host/.Xauthority
+    # create symlink to the X11 unix sockets, we can't mount it to /tmp/.X11-unix in profile, because systemd mounts tmpfs to tmp during start and masks it
+    lxc exec "${CONTAINER_NAME}" -- rmdir  /tmp/.X11-unix || :
+    lxc exec "${CONTAINER_NAME}" -- ln -snf /host/.X11-unix /tmp/ || :
 fi
 
-lxc file push "${XAUTHORITY}" "${CONTAINER_NAME}/$CONTAINER_HOME/.Xauthority"
-lxc exec "${CONTAINER_NAME}" -- su "$CONTAINER_USER" -c "DISPLAY=:0 bash"
+lxc exec "${CONTAINER_NAME}" -- bash -c "DISPLAY=:0 XAUTHORITY=/host/.Xauthority $COMMAND"
 lxc stop "${CONTAINER_NAME}"
