@@ -1,0 +1,28 @@
+[Unit]
+Description=Jump host port forwarding
+Documentation=man:ssh(8)
+
+[Service]
+ExecStart=/usr/bin/ssh -N -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -R %H:22:localhost:22 %i
+ProtectHome=yes
+ProtectSystem=yes
+DynamicUser=yes
+RestartSec=10
+Restart=on-failure
+CapabilityBoundingSet=
+PrivateTmp=yes
+PrivateUsers=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+PrivateMounts=yes
+
+[Install]
+WantedBy=multi-user.target
+
