@@ -1,0 +1,5 @@
+#!/bin/sh
+
+exec gocryptfs -allow_other  /home/.cryptfs/$USER/ /home/$USER
+
+
