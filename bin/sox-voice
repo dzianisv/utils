@@ -1,3 +1,4 @@
-#!/bin/sh
+#!/bin/sh -e
+# dependencies: pulseaudio pulseaudio-utils sox
 if ! pactl list | grep module-null-sink; then pactl load-module module-null-sink; fi
 exec sox -t pulseaudio default -t pulseaudio null pitch -400 contrast 50
