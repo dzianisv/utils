@@ -10,7 +10,7 @@ OUTPUT=$NAME.ogv
 MP4_OUTPUT=$NAME.mp4
 
 ui_notify "Desktop recording started. Press Ctrl+Alt+Shift+S to finish"
-recordmydesktop --on-the-fly-encoding -o $OUTPUT
+recordmydesktop --on-the-fly-encoding -o "$OUTPUT" $*
 ui_notify "Desktop recording finished: $OUTPUT"
-ffmpeg -i $OUTPUT -c:v h264 -preset fast $MP4_OUTPUT
+ffmpeg -i $OUTPUT -c:v h264 -preset fast "$MP4_OUTPUT"
 ui_notify "Transcoded to the $MP4_OUTPUT"

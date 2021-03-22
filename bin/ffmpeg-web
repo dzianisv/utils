@@ -1,5 +1,8 @@
 #!/bin/sh
 set -xe
-out=/tmp/$(basename ${1%.*}).mp4
-ffmpeg -i ${1} -c:v h264 -crf 30 -s 1200x720 ${out}
-notify-send "${out} is ready"
+
+for input in $*; do
+    out=/tmp/$(basename ${input%.*}).mp4
+    ffmpeg -i "$input" -c:v h264 -crf 30 -s 1200x720 "$out"
+    notify-send "$out is ready"
+done
