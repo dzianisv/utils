@@ -3,6 +3,6 @@ set -xe
 
 for input in $*; do
     out=/tmp/$(basename ${input%.*}).mp4
-    ffmpeg -i "$input" -c:v h264 -crf 30 -s 1200x720 "$out"
+    ffmpeg -i "$input" -c:v h264 -crf 30 -s 1920x1080 "$out"
     notify-send "$out is ready"
 done

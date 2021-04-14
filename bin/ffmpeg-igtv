@@ -1,0 +1,14 @@
+#!/bin/bash
+
+if [ -z "$1" ] || [ -z "$2" ]; then
+    echo "Input or output are not specified"
+    exit 1
+fi
+
+AAC_ENCODER=aac
+
+AUDIO_PARAMS="-c:a $AAC_ENCODER -profile:a aac_low -b:a 384k"
+VIDEO_PARAMS="-pix_fmt yuv420p -c:v libx264 -profile:v high -preset slow -crf 18 -s 1920x1080"
+CONTAINER_PARAMS="-movflags faststart"
+
+exec ffmpeg -i "$1" $AUDIO_PARAMS $VIDEO_PARAMS $CONTAINER_PARAMS "$2"

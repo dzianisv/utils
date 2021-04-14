@@ -1,5 +1,5 @@
 #!/bin/sh
 
 rm ./newlist.txt; for file in $(ls -1 -t); do echo "file '$file'" >> ./newlist.txt; done;
-ffmpeg -r 15 -f concat -i newlist.txt  -c:v h264 -vf scale=3840x2560  "$HOME/$(basename $(pwd))-$(date +"%s").mp4"
+ffmpeg -r 25 -f concat -i newlist.txt  -c:v h264 -vf scale=3840x2560 -vf format=yuv420p "$HOME/$(basename $(pwd))-$(date +"%s").mp4"
 rm newlist.txt
