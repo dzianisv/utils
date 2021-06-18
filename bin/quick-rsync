@@ -1,0 +1,3 @@
+#!/bin/sh 
+CIPHER=chacha20-poly1305@openssh.com
+exec rsync -aHAXxv --numeric-ids --progress -e "ssh -T -c $CIPHER -o Compression=no -x" $*
