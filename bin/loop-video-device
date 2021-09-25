@@ -1,11 +1,13 @@
 #!/bin/bash
+# apt install -yq v4l2loopback-dkms gstreamer1.0-plugins-bad gstreamer1.0-plugins-good gstreamer1.0-tools
+
 set -ex
 
-if [ -z "${FILE}" ]; then
+if [[ -z "${FILE}" ]]; then
     exit 1
 fi
 
-if [ ! lsmod | grep "v4l2loopback" &> /dev/null ] ; then
+if ! lsmod | grep "v4l2loopback" &> /dev/null ; then
     # exclusive_caps is required for Chrome
     sudo modprobe v4l2loopback  exclusive_caps=1 video_nr=10
 fi

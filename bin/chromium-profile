@@ -1,0 +1,3 @@
+#!/bin/sh
+mkdir -p "$HOME/.chromium/"
+exec chromium-browser --disable-web-security --user-data-dir="$HOME/.chromium/$1"

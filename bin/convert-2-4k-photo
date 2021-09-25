@@ -1,0 +1,15 @@
+#!/bin/sh
+# apt install -yq exiftool
+
+set -e
+
+final_resolution=3840x2160
+mkdir -p 4k
+
+for src in $*; do
+    dst="4k/$(basename $src)"
+    convert "$src" -geometry "$final_resolution^" -resize "$final_resolution" "$dst"
+    mogrify "$dst" -gravity center -crop "$final_resolution" 
+    exiftool -tagsfromfile "$src" -all:all -overwrite_original "$dst" || :
+    touch -r "$src" "$dst"
+done
