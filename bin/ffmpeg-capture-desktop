@@ -8,4 +8,8 @@ notify() {
 
 notify "Sleep 5 seconds before start..."
 sleep 5s
-ffmpeg -video_size "$RESOLUTION" -framerate 25 -f x11grab -i :0.0 -f pulse -ac 2 -i default -c:v h264 "desktop-capture-$(date +%s).mp4"
+OUTPUT="desktop-capture-$(date +%s).mp4"
+ffmpeg -video_size "$RESOLUTION" -framerate 25 -f x11grab -i :0.0 -f pulse -ac 2 -i default -c:v h264 "$OUTPUT"
+trap "kill -SIGTERM $!" EXIT
+trap "notify '$OUTPUT'" EXIT
+tail -f /dev/null
