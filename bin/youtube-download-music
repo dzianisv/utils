@@ -1,0 +1,3 @@
+#!/bin/sh
+
+youtube-dl --format bestaudio  --extract-audio  --audio-format mp3  --output "%(title)s.%(ext)s" --yes-playlist --download-archive downloaded.txt --ignore-errors $*
