@@ -1,7 +1,7 @@
 #!/bin/bash
 
-for file in $*; do
+for file in "$*"; do
     out=${file%.*}_story.jpg
     echo "Converting $file to $out"
-    convert "$file" -resize 1920 -rotate 90 -crop 1080x1920+0 "$out" 
+    convert "$file" -rotate 90 -gravity South -crop 9:16 "$out" 
 done

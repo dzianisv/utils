@@ -19,6 +19,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-ss", help="Start offset (seconds)", type=str, default="0")
     parser.add_argument("input_file", nargs="?", help="input media file")
+    parser.add_argument("-t", type=int, help="ffmpeg -t, duration", default=15)
     parser.add_argument("--audio", type=str, help='audio track', default=None)
     parser.add_argument("--caption", type=str, default="", help="story caption")
     parser.add_argument("--caption-font", type=str, default="Comforta", help="Font to draw caption")
@@ -58,7 +59,7 @@ def main():
     video = input.video.filter('scale', scaled_resolution[0], scaled_resolution[1]).crop(crop_offset[0], crop_offset[1], target_resolution[0], target_resolution[1]).drawtext(fontsize=40, fontcolor='white', alpha=0.60, x="(w-text_w-line_h)", y="(h-text_h-line_h)", **drawtext_opt)
     audio = input.audio if args.audio is None else ffmpeg.input(args.audio).audio
 
-    ffmpeg.output(audio, video, "story.mp4", acodec='aac', vcodec='h264', crf=23, t=15, ss=args.ss).run()
+    ffmpeg.output(audio, video, "story.mp4", acodec='aac', vcodec='h264', crf=23, t=args.t, ss=args.ss).run()
     
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
