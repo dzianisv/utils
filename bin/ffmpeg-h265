@@ -1,0 +1,5 @@
+#!/bin/sh
+
+for i in $*; do
+    ffmpeg -i "$i" -c:v h265 -crf 23 -c:a aac "$HOME/$(basename $i)"
+done
