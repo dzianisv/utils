@@ -1,0 +1,5 @@
+#!/bin/sh
+
+for i in $*; do
+    ffmpeg -i "$i" -c:v h264 -crf 23 -c:a aac -vf "transpose=1" "$HOME/$(basename $i)"
+done
