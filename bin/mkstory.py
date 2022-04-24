@@ -14,7 +14,11 @@ def get_resolution(file):
 
     width = int(video_stream['width'])
     height = int(video_stream['height'])
-    return  width, height
+    
+    if 'tags' in video_stream and int(video_stream['tags']['rotate']) == 90:
+        return height, width
+    else:
+        return  width, height
 
 def get_duration(file):
     metadata = ffmpeg.probe(file)
@@ -51,9 +55,6 @@ def main():
     
     if target_resolution[1] != source_resolution[1]:
         scale_factor = max(scale_factor, target_resolution[1]/source_resolution[1])
-    
-    if scale_factor == 0:
-        scale_factor = 1
 
     scaled_resolution = (source_resolution[0] * scale_factor, source_resolution[1] * scale_factor)
     if args.gravity == GravityType.CENTER:
