@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+# python3 -m pip install -U ffmpeg-python
 import ffmpeg
 import os
 import logging
@@ -15,7 +15,7 @@ def get_resolution(file):
     width = int(video_stream['width'])
     height = int(video_stream['height'])
     
-    if 'tags' in video_stream and int(video_stream['tags']['rotate']) == 90:
+    if 'tags' in video_stream and 'rotate' in video_stream['tags'] and int(video_stream['tags']['rotate']) == 90:
         return height, width
     else:
         return  width, height
