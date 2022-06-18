@@ -1,5 +1,7 @@
 #!/bin/sh
 
-for i in $*; do
-    ffmpeg -i "$i" -c:v h264 -crf 23 -c:a aac "$HOME/$(basename $i)"
+for i in "$@"; do
+    base=$(basename "$i")
+    name=${base%.*}
+    ffmpeg -i "$i" -c:v h264 -crf 23 -c:a aac "$HOME/$name.mp4"
 done
