@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+for SRC in $*; do
+    BASENAME=$(basename "$SRC")
+    NAME=${BASENAME%.*}
+    EXT=${BASENAME##*.}
+    
+    JUNK="$(dirname "$SRC")/Junk"
+    DST="$NAME-HEVC.$EXT"
+
+    mkdir -p "$JUNK"
+    ffmpeg -i "$SRC" -c:v hevc -crf 23 -c:a aac "$DST"
+    touch -r "$SRC" "$DST"
+    mv "$SRC" "$JUNK/"
+done
