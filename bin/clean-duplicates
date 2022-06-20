@@ -1,0 +1,16 @@
+#!/bin/bash
+$DST_DIR=$1
+if [[ ! -d "$DST_DIR" ]]; then
+    echo "Comparison directory doesn't exist"
+    exit 1
+fi
+
+for file in *; do 
+    src_hash=$(sha1sum "$file" | head -c 40)
+    dst_hash=$(sha1sum "$DST_DIR/$file" | head -c 40)
+    echo "$src_hash $dst_hash"; 
+    if [[ "$src_hash" == "$dst_hash" ]]; then 
+        rm "$file"
+        echo "Removed $file"
+    fi; 
+done;
