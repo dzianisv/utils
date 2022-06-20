@@ -22,23 +22,31 @@ for file in *; do
     dst_file="${DST_DIR}/${file}"
     src_file="${file}"
 
+    if [[ ! -f "${src_file}" ]]; then
+        echo "Skip ${src_file}. Not a file"
+        continue
+    fi
+
+    if [[ ! -f "${dst_file}" ]]; then
+        echo "${dst_file} doesn't exist, moving ${src_file} to ${dst_file}"
+        mv "${src_file}" "${DST_DIR}/"
+        continue
+    fi
+
     src_hash=$(sha1sum "${file}" | head -c 40)
     dst_hash=$(sha1sum "${dst_file}" | head -c 40)
-    
     echo "File hashsum: ${src_hash} ${dst_hash}"; 
-    if [[ ! -f "${dst_file}" ]]; then
-        mv "${src_file}" "${DST_DIR}/"
+    
     if [[ "${src_hash}" == "${dst_hash}" ]]; then 
-        rm "${file}"
-        echo "Removed $file"
+        mv "${src_file}" ".$src_file"
     else
         file_ext=${file##*.}
         file_name=${file%.*}
-        unique_dst_file="${DST_DIR}/${file_name}_${dst_hash}.${file_ext}"
+        unique_dst_file="${DST_DIR}/${file_name}_${dst_hash:0:8}.${file_ext}"
 
         if [[ ! -f "$unique_dst_file" ]]; then
-            mv "$src_file" "$dst_file"
-            echo "Moving $src_file to $dst_file"  
+            mv "$src_file" "$unique_dst_file"
+            echo "Moving $src_file to $unique_dst_file"  
         else
             echo "File $unique_dst_file exists"
             continue
