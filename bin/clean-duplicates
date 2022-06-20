@@ -5,6 +5,11 @@ if [[ ! -d "$DST_DIR" ]]; then
     exit 1
 fi
 
+if [[ "$(pwd)" == "$(readlink -e "$DST_DIR")" ]]; then
+    echo "Destination directory should not be a working directory"
+    exit 1
+fi
+
 for file in *; do 
     src_hash=$(sha1sum "$file" | head -c 40)
     dst_hash=$(sha1sum "$DST_DIR/$file" | head -c 40)
