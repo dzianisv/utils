@@ -32,17 +32,14 @@ for file in *; do
         mv "${src_file}" "${DST_DIR}/"
         continue
     fi
-
-    src_hash=$(sha1sum "${file}" | head -c 40)
-    dst_hash=$(sha1sum "${dst_file}" | head -c 40)
-    echo "File hashsum: ${src_hash} ${dst_hash}"; 
     
-    if [[ "${src_hash}" == "${dst_hash}" ]]; then 
-        mv "${src_file}" ".$src_file"
+    if cmp -s "${src_file}" "${dst_file}"; then 
+        echo "${src_file} duplicates ${dst_file}"
+        rm "${src_file}"
     else
         file_ext=${file##*.}
         file_name=${file%.*}
-        unique_dst_file="${DST_DIR}/${file_name}_${dst_hash:0:8}.${file_ext}"
+        unique_dst_file="${DST_DIR}/${file_name}-1.${file_ext}"
 
         if [[ ! -f "$unique_dst_file" ]]; then
             mv "$src_file" "$unique_dst_file"
