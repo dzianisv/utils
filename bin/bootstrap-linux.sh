@@ -6,5 +6,9 @@ echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg arch=
 apt update -yq
 apt install -y brave-browser
 
-apt install -y vim ffmpeg gocryptfs sshfs 
-snap install -y lxd vscode
+apt install -y vim ffmpeg gocryptfs sshfs gnupg2 pass iptables-persistent docker.io virtualbox
+snap install --classic code
+snap install lxd
+gpasswd -a $(id -u -n) docker
+gpasswd -a $(id -u -n) lxd
+gpasswd -a $(id -u -n) vboxusers
