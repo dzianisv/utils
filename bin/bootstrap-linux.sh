@@ -1,4 +1,5 @@
 #!/bin/sh
+set -eu
 
 apt install -yq apt-transport-https curl
 curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
