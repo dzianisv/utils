@@ -13,3 +13,7 @@ snap install lxd
 gpasswd -a $(id -u -n) docker
 gpasswd -a $(id -u -n) lxd
 gpasswd -a $(id -u -n) vboxusers
+
+curl "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" > /usr/local/bin/yt-dlp
+chmod a+x /usr/local/bin/yt-dlp
+
