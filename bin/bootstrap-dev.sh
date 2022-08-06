@@ -10,7 +10,7 @@ if ! command -v brave-browser ; then
 fi 
 
 if ! command -v code; then
-    curl -L  https://packages.microsoft.com/keys/microsoft.asc | gpg2 --dearmor > "/usr/share/keyrings/packages.microsoft.gpg"
+    curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -
     echo "deb [arch=amd64,arm64,armhf] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list
     apt update -yq
     apt install -yq code

@@ -10,7 +10,7 @@ if ! command -v brave-browser ; then
 fi 
 
 if ! command -v signal-desktop; then
-    curl -Lo "/usr/share/keyrings/signal-desktop-keyring.gpg" "https://updates.signal.org/desktop/apt/keys.asc"
+    curl -L "https://updates.signal.org/desktop/apt/keys.asc" | gpg2 --dearmor > "/usr/share/keyrings/signal-desktop-keyring.gpg"
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/signal-desktop-keyring.gpg] https://updates.signal.org/desktop/apt xenial main' | tee -a /etc/apt/sources.list.d/signal-xenial.list
     apt update -yq && apt install -yq signal-desktop
 fi
@@ -27,8 +27,8 @@ if ! command -v yt-dlp; then
 fi
 
 if ! command -v code; then
-    curl -Lo "/etc/apt/keyrings/packages.microsoft.gpg" https://packages.microsoft.com/keys/microsoft.gpg
-    echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" | tee /etc/apt/sources.list.d/vscode.list
+    curl -L "https://packages.microsoft.com/keys/microsoft.asc" | gpg2 --dearmor > "/usr/share/keyrings/code.gpg"
+    echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/code.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list
     apt update -yq
     apt install -yq code
 fi
