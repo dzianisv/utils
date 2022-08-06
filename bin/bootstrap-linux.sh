@@ -29,7 +29,8 @@ curl "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" > /usr/l
 chmod a+x /usr/local/bin/yt-dlp
 
 
-if [ ! -e /usr/local/bin/session-desktop ]; then
-    curl -L "https://getsession.org/linux" > /usr/local/bin/session-desktop
-    chmod a+x /usr/local/bin/session-desktop
+if ! command -v session-desktop; then
+    curl -o /tmp/session-desktop.deb "https://github.com/oxen-io/session-desktop/releases/download/v1.8.6/session-desktop-linux-amd64-1.8.6.deb"
+    trap "rm /tmp/session-desktop.deb" EXIT
+    apt install -y /tmp/session-desktop.deb
 fi
