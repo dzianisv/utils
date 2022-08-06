@@ -27,7 +27,10 @@ if ! command -v yt-dlp; then
 fi
 
 if ! command -v code; then
-    snap install --classic code
+    curl -Lo "/etc/apt/keyrings/packages.microsoft.gpg" https://packages.microsoft.com/keys/microsoft.gpg
+    echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" | tee /etc/apt/sources.list.d/vscode.list
+    apt update -yq
+    apt install -yq code
 fi
 
 if ! command -v lxc; then
