@@ -10,7 +10,7 @@ if ! command -v brave-browser ; then
 fi 
 
 if ! command -v code; then
-    curl -Lo "/etc/apt/keyrings/packages.microsoft.gpg" https://packages.microsoft.com/keys/microsoft.gpg
+    curl -Lo "/etc/apt/keyrings/packages.microsoft.asc" https://packages.microsoft.com/keys/microsoft.asc
     echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" | tee /etc/apt/sources.list.d/vscode.list
     apt update -yq
     apt install -yq code
@@ -26,7 +26,7 @@ fi
 if ! command -v tsh; then
     curl https://deb.releases.teleport.dev/teleport-pubkey.asc -o /usr/share/keyrings/teleport-archive-keyring.asc
     source /etc/os-release
-    echo "deb [signed-by=/usr/share/keyrings/teleport-archive-keyring.asc] https://apt.releases.teleport.dev/${ID?} ${VERSION_CODENAME?} stable/v10" | tee /etc/apt/sources.list.d/teleport.list > /dev/null
+    echo "deb [signed-by=/usr/share/keyrings/teleport-archive-keyring.asc] https://apt.releases.teleport.dev/${ID?} ${VERSION_CODENAME?} stable/v10" | tee /etc/apt/sources.list.d/teleport.list
     apt update -yq
     apt-get install teleport
 fi
