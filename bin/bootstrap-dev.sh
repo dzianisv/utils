@@ -31,6 +31,6 @@ if ! command -v tsh; then
     apt-get install teleport
 fi
 
-apt install -y vim sshfs gnupg2 docker.io  golang g++ clang zeal python3 python3-pip python3-pipenv node npm
+apt install -y vim sshfs gnupg2 docker.io  golang g++ clang zeal python3 python3-pip pipenv nodejs npm python3-bpython
 gpasswd -a $(id -u -n) docker
 
