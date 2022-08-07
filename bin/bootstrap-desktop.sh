@@ -33,6 +33,12 @@ if ! command -v code; then
     apt install -yq code
 fi
 
+if ! command -v rslsync; then
+    curl "https://download-cdn.resilio.com/2.7.3.1381/Debian/resilio-sync_2.7.3.1381-1_amd64.deb" -o /tmp/rslsync.deb
+    trap "rm /tmp/rslsync.deb" EXIT
+    apt install /tmp/rslsync.deb
+fi
+
 if ! command -v lxc; then
     snap install lxd
     gpasswd -a $(id -u -n) lxd

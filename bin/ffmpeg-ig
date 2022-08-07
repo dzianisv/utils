@@ -3,6 +3,6 @@
 for i in "$@"; do
     name="${f%.*}"
 
-    ffmpeg -y -i "$i" -c:v libx264 -vf "scale=1920:1080" -b:v 3.5M -pass 1 -an -f mp4 /dev/null
-    ffmpeg -y -i "$i" -c:v libx264 -vf "scale=1920:1080" -b:v 3.5M -pass 2 -c:a aac "${name}_ig.mp4"
+    ffmpeg -y -i "$i" -c:v libx264 -vf "scale=1920:1080" -b:v 4M -pass 1 -an -f mp4 /dev/null
+    ffmpeg -y -i "$i" -c:v libx264 -vf "scale=1920:1080" -b:v 4M -pass 2 -c:a aac "${name}_ig.mp4"
 done
