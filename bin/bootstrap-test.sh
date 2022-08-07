@@ -17,7 +17,7 @@ if ! command -v code; then
 fi
 
 if ! command -v torctl; then
-    curl -Lo /tmp/torctl.deb "https://github.com/dzianisv/torctl/releases/download/1.0.0/torctl_1.0.0_all.deb"
+    curl -Lo /tmp/torctl.deb "https://github.com/dzianisv/torctl/releases/download/1.0.1/torctl_1.0.1_all.deb"
     trap "rm /tmp/torctl.deb" EXIT
     apt install /tmp/torctl.deb
 fi
