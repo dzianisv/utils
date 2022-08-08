@@ -17,12 +17,14 @@ if ! command -v code; then
 fi
 
 if ! command -v torctl; then
-    curl -Lo /tmp/torctl.deb "https://github.com/dzianisv/torctl/releases/download/1.0.1/torctl_1.0.1_all.deb"
+    curl -Lo /tmp/torctl.deb "https://github.com/dzianisv/torctl/releases/download/1.0.2/torctl_1.0.2_all.deb"
     trap "rm /tmp/torctl.deb" EXIT
     apt install /tmp/torctl.deb
 fi
 
 apt install -y vim sshfs gnupg2 zeal python3 python3-pip pipenv nodejs npm python3-bpython
+apt install -y libreoffice-calc libreoffice-gnome
+
 gpasswd -a $(id -u -n) docker
 
 prompt="export PS1=\"\$(curl -m3 api.ipify.org 2>/dev/null) \$PS1\""
