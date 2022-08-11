@@ -39,6 +39,13 @@ if ! command -v rslsync; then
     apt install /tmp/rslsync.deb
 fi
 
+if ! command -v tailscale; then
+    curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg" -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+    curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list" -o /etc/apt/sources.list.d/tailscale.list
+    apt-get update
+    apt-get install -yq tailscale avahi-daemon
+fi
+
 if ! command -v lxc; then
     snap install lxd
     gpasswd -a $(id -u -n) lxd
