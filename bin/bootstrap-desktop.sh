@@ -51,6 +51,6 @@ if ! command -v lxc; then
     gpasswd -a $(id -u -n) lxd
 fi
 
-apt install -y vim ffmpeg gocryptfs sshfs gnupg2 pass iptables-persistent docker.io virtualbox
+apt install -y vim ffmpeg gocryptfs sshfs gnupg2 pass iptables-persistent docker.io virtualbox libreoffice-gnome libreoffice-writer libreoffice-calc
 gpasswd -a $(id -u -n) docker
 gpasswd -a $(id -u -n) vboxusers
