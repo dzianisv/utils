@@ -51,6 +51,11 @@ if ! command -v lxc; then
     gpasswd -a $(id -u -n) lxd
 fi
 
-apt install -y vim ffmpeg gocryptfs sshfs gnupg2 pass iptables-persistent docker.io virtualbox libreoffice-gnome libreoffice-writer libreoffice-calc
+apt install -y vim ffmpeg gocryptfs sshfs gnupg2 pass iptable s-persistent docker.io virtualbox
+apt install -yq libreoffice-gnome libreoffice-writer libreoffice-calc
+apt isntall -yq pytnon3 pylint bpython
 gpasswd -a $(id -u -n) docker
 gpasswd -a $(id -u -n) vboxusers
+
+# allow operations on PDF documents
+sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<plicy domain="coder" rights="read | write" pattern="PDF" \/>/g' /etc/ImageMagick-6/policy.xml
