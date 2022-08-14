@@ -59,3 +59,7 @@ gpasswd -a $(id -u -n) vboxusers
 
 # allow operations on PDF documents
 sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<plicy domain="coder" rights="read | write" pattern="PDF" \/>/g' /etc/ImageMagick-6/policy.xml
+
+if grep 'export PS1="\$(ip netns identify) $PS1"' ~/.bashrc;
+    echo 'export PS1="\$(ip netns identify) $PS1"' >> ~/.bashrc
+fi
