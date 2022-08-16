@@ -37,6 +37,7 @@ if ! command -v rslsync; then
     curl "https://download-cdn.resilio.com/2.7.3.1381/Debian/resilio-sync_2.7.3.1381-1_amd64.deb" -o /tmp/rslsync.deb
     trap "rm /tmp/rslsync.deb" EXIT
     apt install /tmp/rslsync.deb
+    sed -i 's/WantedBy=multi-user.target/WantedBy=default.target/g' /usr/lib/systemd/user/resilio-sync.service 
 fi
 
 if ! command -v tailscale; then
@@ -53,7 +54,7 @@ fi
 
 apt install -y vim ffmpeg gocryptfs sshfs gnupg2 pass iptable s-persistent docker.io virtualbox
 apt install -yq libreoffice-gnome libreoffice-writer libreoffice-calc
-apt isntall -yq pytnon3 pylint bpython
+apt isntall -yq pytnon3 pylint bpython zile
 gpasswd -a $(id -u -n) docker
 gpasswd -a $(id -u -n) vboxusers
 
