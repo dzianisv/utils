@@ -55,6 +55,7 @@ fi
 apt install -y vim ffmpeg gocryptfs sshfs gnupg2 pass iptable s-persistent docker.io virtualbox
 apt install -yq libreoffice-gnome libreoffice-writer libreoffice-calc
 apt isntall -yq pytnon3 pylint bpython zile
+apt install -yq calibre
 gpasswd -a $(id -u -n) docker
 gpasswd -a $(id -u -n) vboxusers
 
