@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-apt install -yq apt-transport-https curl
+apt install -yq apt-transport-https curl gnupg2
 
 if ! command -v brave-browser ; then
     curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg "https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg"
@@ -52,9 +52,9 @@ if ! command -v lxc; then
     gpasswd -a $(id -u -n) lxd
 fi
 
-apt install -y vim ffmpeg gocryptfs sshfs gnupg2 pass iptable s-persistent docker.io virtualbox
+apt install -y vim ffmpeg gocryptfs sshfs pass iptables-persistent docker.io virtualbox
 apt install -yq libreoffice-gnome libreoffice-writer libreoffice-calc
-apt isntall -yq pytnon3 pylint bpython zile
+apt install -yq python3 pylint bpython zile
 apt install -yq calibre
 gpasswd -a $(id -u -n) docker
 gpasswd -a $(id -u -n) vboxusers
@@ -62,6 +62,6 @@ gpasswd -a $(id -u -n) vboxusers
 # allow operations on PDF documents
 sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<plicy domain="coder" rights="read | write" pattern="PDF" \/>/g' /etc/ImageMagick-6/policy.xml
 
-if grep 'export PS1="\$(ip netns identify) $PS1"' ~/.bashrc;
+if grep 'export PS1="\$(ip netns identify) $PS1"' ~/.bashrc; then
     echo 'export PS1="\$(ip netns identify) $PS1"' >> ~/.bashrc
 fi
