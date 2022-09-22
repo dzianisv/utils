@@ -47,6 +47,12 @@ if ! command -v tailscale; then
     apt-get install -yq tailscale avahi-daemon
 fi
 
+if ! command -v hotspotshield; then
+    curl -fsSl "https://repo.hotspotshield.com/deb/rel/all/pool/main/h/hotspotshield/hotspotshield_1.0.7_amd64.deb" > /tmp/hss.deb
+    trap "rm /tmp/hss.deb" EXIT
+    apt install -yq /tmp/hss.deb
+fi
+
 if ! command -v lxc; then
     snap install lxd
     gpasswd -a $(id -u -n) lxd
