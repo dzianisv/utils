@@ -47,6 +47,12 @@ if ! command -v tailscale; then
     apt-get install -yq tailscale avahi-daemon
 fi
 
+if ! command -v hotspotshield; then
+    curl -fsSl "https://repo.hotspotshield.com/deb/rel/all/pool/main/h/hotspotshield/hotspotshield_1.0.7_amd64.deb" > /tmp/hss.deb
+    trap "rm /tmp/hss.deb" EXIT
+    apt install -yq /tmp/hss.deb
+fi
+
 if ! command -v lxc; then
     snap install lxd
     gpasswd -a $(id -u -n) lxd
@@ -54,10 +60,10 @@ fi
 
 apt install -y vim ffmpeg gocryptfs sshfs pass iptables-persistent docker.io virtualbox
 apt install -yq libreoffice-gnome libreoffice-writer libreoffice-calc
-apt install -yq python3 pylint bpython zile
+apt install -yq python3 pylint bpython zile 
 apt install -yq goldendict
 apt install -yq calibre
-apt install -yq atop htop iotop 
+apt install -yq atop htop iotop git-remote-gcrypt
 gpasswd -a $(id -u -n) docker
 gpasswd -a $(id -u -n) vboxusers
 
