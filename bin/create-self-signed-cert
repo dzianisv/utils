@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+NAME=${1:-server}}
+exec openssl req  -nodes -new -x509  -keyout "${NAME}.key" -out "${NAME}.cert"
