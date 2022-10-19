@@ -1,0 +1,2 @@
+#!/bin/sh
+exec gpg --quick-generate-key "$(git config username) <$(git config user.email)>" ed25519 cert never
