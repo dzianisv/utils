@@ -84,6 +84,12 @@ if ! command -v npm; then
     npm i -g npm
 fi
 
+if ! grep "pinentry-program /usr/local/bin/pinentry-mac" ~/.gnupg/gpg-agent.conf; then
+    mkdir -p ~/.gnupg/
+    echo "pinentry-program /usr/local/bin/pinentry-mac" >> ~/.gnupg/gpg-agent.conf
+    gpgconf --kill gpg-agent  && gpgconf --launch gpg-agent
+fi
+
 if [ -z "$(git config user.email)" ]; then
     echo "Run\n\tgit config --global user.email <email>\n\tgit  config --global user.name <name>"
     exit 1
