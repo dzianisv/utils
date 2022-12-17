@@ -1,0 +1,41 @@
+#!/bin/bash
+# Copy $* to the workdir
+
+set -u # fail if variable is not defined
+
+DST_DIR=$(pwd)
+
+
+for file in "$@"; do
+    dst_file="${DST_DIR}/${file}"
+    src_file="${file}"
+
+    if [[ ! -f "${src_file}" ]]; then
+        echo "Skip ${src_file}. Not a file"
+        continue
+    fi
+
+    if [[ ! -f "${dst_file}" ]]; then
+        echo "${dst_file} doesn't exist, copying ${src_file} to ${dst_file}"
+        cp "${src_file}" "${DST_DIR}/"
+        touch "${dst_file}" -r "$src_file"
+        continue
+    fi
+
+    if cmp -s "${src_file}" "${dst_file}"; then
+        echo "${src_file} duplicates ${dst_file}"
+    else
+        file_ext=${file##*.}
+        file_name=${file%.*}
+        unique_dst_file="${DST_DIR}/${file_name}-1.${file_ext}"
+
+        if [[ ! -f "$unique_dst_file" ]]; then
+            cp "$src_file" "$unique_dst_file"
+            touch "$unique_dst_file" -r "$src_file"
+            echo "Copying $src_file to $unique_dst_file"
+        else
+            echo "File $unique_dst_file exists"
+            continue
+        fi
+    fi
+done
