@@ -1,7 +1,7 @@
 #!/bin/bash
 set -eu
 
-host=${1}
+host=${1:-bananapi.local}
 user=root
 ssh-copy-id "${user}@$host"
 
