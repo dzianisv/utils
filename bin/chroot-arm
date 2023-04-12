@@ -1,0 +1,25 @@
+#!/bin/sh
+
+set -eu
+
+cd ${1:-.}
+
+install -m 0755 `command -v qemu-arm-static` usr/bin/qemu-arm-static
+trap "rm usr/bin/qemu-arm-static" EXIT
+
+if ! mount | grep $(readlink -f dev); then
+    mount -t devtmpfs none dev
+    trap "umount dev" EXIT
+fi
+
+if ! mount | grep $(readlink -f proc); then
+    mount -t proc none proc
+    trap "umount proc" EXIT
+fi
+
+if ! mount | grep $(readlink -f sys); then
+    mount -t sysfs none sys
+    trap "umount sys" EXIT
+fi
+
+chroot . /usr/bin/qemu-arm-static /bin/sh -c "${2:-sh}"
