@@ -5,6 +5,8 @@ if ! command resilio-sync; then
     curl "https://download-cdn.resilio.com/2.7.3.1381/Debian/resilio-sync_2.7.3.1381-1_armhf.deb" > /tmp/resilio-sync.deb
     apt install -yq /tmp/resilio-sync.deb
     systemctl enable --now resilio-sync
+    echo "fs.inotify.max_user_watches=524288" > /etc/sysctl.d/inotify.conf
+    sysctl -p /etc/sysctl.d/inotify.conf
 fi
 
 if ! tailscale status; then
