@@ -67,6 +67,9 @@ PersistentKeepalive = 25
 EOF
 done
 
+echo "sysctl net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ip_forward.conf
+sysctl -p /etc/sysctl.d/99-ip_forward.conf
+
 # Enable and start the WireGuard server
 systemctl enable wg-quick@wg0
 systemctl start wg-quick@wg0
