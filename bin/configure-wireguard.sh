@@ -17,9 +17,8 @@ SERVER_CONFIG="/etc/wireguard/wg0.conf"
 umask 077
 
 # Generate server private and public keys
-wg genkey | tee server_private.key | wg pubkey > server_public.key
-SERVER_PRIVATE_KEY=$(cat server_private.key)
-SERVER_PUBLIC_KEY=$(cat server_public.key)
+SERVER_PRIVATE_KEY=$(wg genkey)
+SERVER_PUBLIC_KEY=$(echo "${SERVER_PRIVATE_KEY}" | wg pubkey)
 
 # Create server configuration
 cat << EOF > $SERVER_CONFIG
@@ -35,18 +34,14 @@ EOF
 # Generate client configurations
 read -p "Enter the number of clients: " N
 for i in $(seq 1 $N); do
-    CLIENT_DIR="client_$i"
-    mkdir $CLIENT_DIR
-    CLIENT_CONFIG="$CLIENT_DIR/wg0-client_$i.conf"
-    wg genkey | tee $CLIENT_DIR/client_private.key | wg pubkey > $CLIENT_DIR/client_public.key
-    CLIENT_PRIVATE_KEY=$(cat $CLIENT_DIR/client_private.key)
-    CLIENT_PUBLIC_KEY=$(cat $CLIENT_DIR/client_public.key)
-
+    CLIENT_CONFIG="wg-${SERVER_PUBLIC_IP}-client${i}.conf"
+    CLIENT_PRIVATE_KEY=$(wg genkey)
+    CLIENT_PUBLIC_KEY=$(echo "${CLIENT_PRIVATE_KEY}" | wg pubkey)
     # Add client peer to server configuration
     cat << EOF >> $SERVER_CONFIG
 [Peer]
 PublicKey = $CLIENT_PUBLIC_KEY
-AllowedIPs = 10.0.0.$(($i+1))/32
+AllowedIPs = 0.0.0.0/0, ::/0
 
 EOF
 
