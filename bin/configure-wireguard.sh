@@ -41,12 +41,13 @@ for i in $(seq 1 $N); do
     CLIENT_CONFIG="wg-${SERVER_PUBLIC_IP}-client${i}.conf"
     CLIENT_PRIVATE_KEY=$(wg genkey)
     CLIENT_PUBLIC_KEY=$(echo "${CLIENT_PRIVATE_KEY}" | wg pubkey)
-    CLIENT_IP=10.0.0.$(($i+1))/24
+    CLIENT_IP=10.0.0.$(($i+1))
+    CIDR=24
     # Add client peer to server configuration
     cat << EOF >> $SERVER_CONFIG
 [Peer]
 PublicKey = $CLIENT_PUBLIC_KEY
-AllowedIPs = $CLIENT_IP
+AllowedIPs = $CLIENT_IP/32
 
 EOF
 
@@ -54,7 +55,7 @@ EOF
     cat << EOF > $CLIENT_CONFIG
 [Interface]
 PrivateKey = $CLIENT_PRIVATE_KEY
-Address = $CLIENT_IP
+Address = $CLIENT_IP/$CIDR
 DNS = 1.1.1.1
 
 [Peer]
