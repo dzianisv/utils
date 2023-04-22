@@ -7,8 +7,9 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 # Install WireGuard
-apt update
-apt install -y wireguard
+if ! command -v wg-quick; then
+    apt update && apt install -y wireguard
+fi
 
 # Server configuration
 SERVER_PORT=51820
@@ -32,7 +33,10 @@ PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -
 EOF
 
 # Generate client configurations
-read -p "Enter the number of clients: " N
+if [ -z "$N" ]; then
+    read -p "Enter the number of clients: " N
+fi
+
 for i in $(seq 1 $N); do
     CLIENT_CONFIG="wg-${SERVER_PUBLIC_IP}-client${i}.conf"
     CLIENT_PRIVATE_KEY=$(wg genkey)
