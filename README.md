@@ -15,10 +15,18 @@ You can simply insert a RaspberryPi, BananaPi or OrangePi flash into your Linux 
 bin/chroot-arm /media/$USER/sdcard
 ```
 
-## Configure Wireguard server
+## Configure VPN servers
 This script configures a Wireguard server and generate configurations for the clients
 
 ```sh
-curl "https://raw.githubusercontent.com/dzianisv/utils/master/bin/configure-wireguard.sh" | N=10 bash -x
+curl "https://raw.githubusercontent.com/dzianisv/utils/master/bin/linux-configure-wireguard.sh" | N=10 bash -x
 ```
+
+Or configure PPTP server on the Linux host:
+```sh
+```sh
+curl "https://raw.githubusercontent.com/dzianisv/utils/master/bin/linux-configure-pptp-server.sh" | bash -x
+```
+```
+
 
