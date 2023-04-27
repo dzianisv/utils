@@ -38,7 +38,7 @@ EOL
 read -p "Enter the PPTP username: " USERNAME
 read -s -p "Enter the PPTP password: " PASSWORD
 echo ""
-echo '${USERNAME} pptpd ${PASSWORD} *' >> /etc/ppp/chap-secrets
+echo "${USERNAME} pptpd ${PASSWORD} *">> /etc/ppp/chap-secrets
 
 # Enable IP forwarding
 sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/g' /etc/sysctl.conf
