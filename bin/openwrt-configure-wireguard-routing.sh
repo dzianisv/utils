@@ -45,22 +45,26 @@ chmod a+x /etc/hotplug.d/iface/99-guestNetwork
 
 cat << EOF > /etc/hotplug.d/iface/99-wireguard
 #!/bin/sh
+source "/etc/hotplug.d/iface/common"
 
-source "$INCLUDE_FILE"
-
-if [ "\$ACTION" != 'ifup' ] || [[ ! "\$INTERFACE" =~ ^wg[0-9]+$ ]]; then
+if [[ ! "\$INTERFACE" =~ ^wg[0-9]+$ ]]; then
 	exit 0
 fi
 
-by_networks=\$(curl https://noc.datahata.by/free.txt)
-youtube_networks=\$(curl https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/ipv4_list.txt)
 
-for network in \$networks \$youtube_networks; do
-    ip route add "\$network" dev "\$WAN_INTERFACE"
-done
+if [[ "\$ACTION" = "ifup" ]]; then
+	by_networks=\$(curl https://noc.datahata.by/free.txt)
+	youtube_networks=\$(curl https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/ipv4_list.txt)
 
-ip route del default
-ip route add default via 10.0.0.1
+	for network in \$networks \$youtube_networks; do
+    		ip route add "\$network" dev "\$WAN_INTERFACE"
+	done
+
+	ip route del default
+	ip route add default via 10.0.0.1
+elif [[ "\$ACTION" = "ifdown" ]]; then
+	ip route add default dev "\$WAN_INTERFACE"
+fi
 EOF
 
 chmod a+x /etc/hotplug.d/iface/99-wireguard
