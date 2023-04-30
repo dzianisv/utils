@@ -12,9 +12,11 @@ fi
 if ! tailscale status; then
     curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg" -o /usr/share/keyrings/tailscale-archive-keyring.gpg
     curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list" -o /etc/apt/sources.list.d/tailscale.list
+    tailscale up
+fi
+
+if ! command -v avahi-daemon; then
     apt-get update
     apt-get install -yq tailscale avahi-daemon
     curl "https://raw.githubusercontent.com/lathiat/avahi/master/avahi-daemon/ssh.service" > /etc/avahi/services/ssh.service
-
-    tailscale up
 fi
