@@ -25,20 +25,38 @@ EOF
 cat << EOF > /etc/hotplug.d/iface/99-guestNetwork
 #!/bin/sh
 
-source "/etc/hotplug.d/iface/common"
-set -euo pipefail
+source "$INCLUDE_FILE"
+set -uo pipefail
 
-NETWORK=192.168.42.0/24
+get_nic_network() {
+    address=\$(ip addr show \$1 | awk '/inet / {print \$2}')
+    # Get IP address and CIDR netmask
+    ipaddr=\$(echo \$1 | cut -d/ -f1)
+    netmask=\$(echo \$1 | cut -d/ -f2)
 
-if [ "\$ACTION" = "ifup" ] || [[ "\$INTERFACE" =~ ^br-guest.*$ ]]; then
-    ip rule add from "\$NETWORK" lookup "$TABLE"
-    ip route add "\$NETWORK" dev "\$INTERFACE"
+    # Calculate network address
+    echo \$ipaddr | IFS=. read -r i1 i2 i3 i4
+    ipdec=\$(( (i1<<24) + (i2<<16) + (i3<<8) + i4 ))
+
+    echo \$(printf "%d.%d.%d.%d" \$((~((1<<(32-netmask))-1) >> 24 & 0xFF)) \$((~((1<<(32-netmask))-1) >> 16 & 0xFF)) \$((~((1<<(32-netmask))-1) >> 8 & 0xFF)) \$((~((1<<(32-netmask))-1) & 0xFF)))
+    netmaskdec=\$(( (m1<<24) + (m2<<16) + (m3<<8) + m4 )) | IFS=. read -r m1 m2 m3 m4
+
+    netdec=\$(( ipdec & netmaskdec ))
+    netaddr=\$(printf "%d.%d.%d.%d" \$((netdec>>24)) \$((netdec>>16&0xFF)) \$((netdec>>8&0xFF)) \$((netdec&0xFF)))
+
+    echo "\${netaddr}/\${netmask}"
+}
+
+LOCAL_INTERFACE=br-guestLan
+NETWORK=\$(get_nic_network "\$LOCAL_INTERFACE")
+
+if [ "\$ACTION" = "ifup" ]; then
+    if ! ip rule show | grep "from \$NETWORK"; then
+        ip rule add from "\$NETWORK" lookup guestNetwork
+    fi
+    ip route add "\$NETWORK" dev "\$LOCAL_INTERFACE" table guestNetwork
+    ip route add default dev "\$WAN_INTERFACE" table guestNetwork
 fi
-
-if [ "\$INTERFACE" = "\$WAN_INTERFACE"] && [ "\$ACTION" = "ifup" ]; then
-    ip route add default dev "\$WAN_INTERFACE" table "$TABLE"
-fi
-
 EOF
 chmod a+x /etc/hotplug.d/iface/99-guestNetwork
 

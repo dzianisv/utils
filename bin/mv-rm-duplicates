@@ -4,16 +4,16 @@
 # Files with the same file_name will be refile_named and moved to the Destination Directory
 # Unique files will be moved from the Working Directory to the Destination Directory
 
-set -u # fail if variable is not defined
+set -ueo pipefail
 
-DST_DIR=$(readlink -e $1)
+DST_DIR=$(readlink -f $1)
 
 if [[ ! -d "${DST_DIR}" ]]; then
     echo "Directory ${DST_DIR} doesn't exist"
     exit 1
 fi
 
-if [[ "$(pwd)" == "$(readlink -e "${DST_DIR}")" ]]; then
+if [[ "$(pwd)" == "$(readlink -f "${DST_DIR}")" ]]; then
     echo "Destination directory should not be a working directory"
     exit 1
 fi
