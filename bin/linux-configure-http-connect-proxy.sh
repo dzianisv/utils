@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# This script configures a Squid HTTP-COnnect proxy server on Ubuntu server
+# with PROXY_USER and PROXY_PASSWORD basic authentication.
+
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
     echo "Please run this script as root or with sudo."

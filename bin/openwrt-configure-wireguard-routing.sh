@@ -8,6 +8,7 @@
 set -eu
 # Confiugre the WAN interface, 3g network interface is used by default
 WAN_INTERFACE=3g-3g
+GUEST_INTERFACE=br-guestLan # TODO: read from the /etc/config/networks
 INCLUDE_FILE=/etc/hotplug.d/iface/common
 
 # guest network routing rules will be added to this table
@@ -47,7 +48,7 @@ get_nic_network() {
     echo "\${netaddr}/\${netmask}"
 }
 
-LOCAL_INTERFACE=br-guestLan
+LOCAL_INTERFACE=$GUEST_INTERFACE
 NETWORK=\$(get_nic_network "\$LOCAL_INTERFACE")
 
 if [ "\$ACTION" = "ifup" ]; then
