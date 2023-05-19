@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 
-#pip install pyautogui
+"""
+Dependencies:
+`pip install pyautogui`
+
+Grant permissions to the Terminal
+System Preferences -> Security & Privacy -> Privacy -> Accessibility -> [*] Terminal
+"""
 
 import pyautogui
 import time
