@@ -21,6 +21,11 @@ if ! grep "$TABLE" < /etc/iproute2/rt_tables; then
     echo "100 $TABLE" >> /etc/iproute2/rt_tables
 fi
 
+if ! command -v curl; then
+	opkg update
+	opkg install -y curl
+fi
+
 cat << EOF > "$INCLUDE_FILE"
 WAN_INTERFACE=$WAN_INTERFACE
 OPENWRT_WAN_INTERFACE=\${WAN_INTERFACE##*-}
@@ -61,26 +66,51 @@ cat << EOF > /etc/hotplug.d/iface/99-wireguard
 #!/bin/sh
 source "/etc/hotplug.d/iface/common"
 
-if [[ ! "\$INTERFACE" =~ ^wg[0-9]+$ ]]; then
+if [[ ! "$INTERFACE" =~ ^wg[0-9]+$ ]]; then
 	exit 0
 fi
 
+gateway=$(uci get network.$INTERFACE.gateway)
 
-if [[ "\$ACTION" = "ifup" ]]; then
-	by_networks=\$(curl https://noc.datahata.by/free.txt)
-	youtube_networks=\$(curl https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/ipv4_list.txt)
+if [ -z "$gateway" ]; then
+	echo "Gateway for $INTERFACE is not set" >&2
+	exit 1
+fi
 
-	for network in \$networks \$youtube_networks; do
-    		ip route add "\$network" dev "\$WAN_INTERFACE"
+resolve_ip() {
+  domain=$1
+  nslookup $domain 1.1.1.1 | awk '/^Address: / { print $2 }' | tail -n1
+}
+
+if [[ "$ACTION" = "ifup" ]]; then
+	bypass_hosts=""
+	for bypass_domain in kufar.by; do
+		for _ in {1..16}; do
+			ip=$(resolve_ip "$bypass_domain")
+			if [[ -z "$ip" ]] ||  expr "$bypass_hosts" : ".*$ip.*"; then
+				continue
+			fi
+			bypass_hosts="$bypass_hosts $ip"
+			ip route add "$ip" dev "$WAN_INTERFACE"
+		done
 	done
 
+	bypass_networks=$(curl https://noc.datahata.by/free.txt)
+	youtube_networks=$(curl https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/ipv4_list.txt)
+
+	for network in $bypass_networks $youtube_networks; do
+    		ip route add "$network" dev "$WAN_INTERFACE" 2> /dev/null
+	done
+
+	prev_default_route=$(ip route show | grep default)
 	ip route del default
-	ip route add default via 10.0.0.1
-elif [[ "\$ACTION" = "ifdown" ]]; then
-	ip route add default dev "\$WAN_INTERFACE"
+	ip route add $prev_default_route metric 500
+    ip route add "$gateway" dev "$INTERFACE"
+	ip route add default via "$gateway"
+
+elif [[ "$ACTION" = "ifdown" ]]; then
+	echo "VPN is down :("
 fi
 EOF
-
-
 
 chmod a+x /etc/hotplug.d/iface/99-wireguard
