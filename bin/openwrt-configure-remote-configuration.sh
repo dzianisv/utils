@@ -78,7 +78,7 @@ cat <<EOF > "$CRON_JOB_PATH"
 EOF
 
 # Set permissions for the cron job file
-chmod 644 "$CRON_JOB_PATH"
+chmod 0644 "$CRON_JOB_PATH"
 
 # Restart the cron service
 /etc/init.d/cron restart
