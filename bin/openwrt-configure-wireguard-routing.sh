@@ -2,9 +2,10 @@
 # how to configure:
 #
 # cat > /tmp/configure.sh && sh -x /tmp/configure.sh
-
+#
 # This OpenWrt configuration script automates the setup of guest networking using 'guestNetwork' routing table
 # and WireGuard VPN routing for selective bypassing for *.BY and youtube.com subnets.
+# Wirguard network has to be named like wg0-wg9 and `uci set newtwork.wg0.gateway=` has to be set correctly
 
 set -eu
 # Confiugre the WAN interface, 3g network interface is used by default
@@ -73,7 +74,7 @@ fi
 gateway=$(uci get network.$INTERFACE.gateway)
 
 if [ -z "$gateway" ]; then
-	echo "Gateway for $INTERFACE is not set" >&2
+	echo "Gateway for $INTERFACE is not set. Example: uci set network.$INTERFACE.gateway=10.0.0.1 && uci commit network" >&2
 	exit 1
 fi
 

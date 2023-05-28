@@ -3,20 +3,17 @@
 SCRIPT_PATH="/usr/bin/configurator"
 CRON_JOB_PATH="/etc/crontabs/root"
 
+if ! command -v curl || ! command -v jq; then
+    opkg update
+    opkg install curl jq
+fi
+
 # Create the installation script
 cat << 'EOF' > "$SCRIPT_PATH"
 #!/bin/sh
 
 # Define the URL and script paths
 CONFIGURATION_URL=$(configurator.@general[0].url)
-
-# Function to require packages
-require_packages() {
-    if ! command -v curl || ! command -v jq; then
-        opkg update
-        opkg install curl jq
-    fi
-}
 
 # Function to find wireless interface by SSID
 find_wireless_interface_by_ssid() {
@@ -66,8 +63,6 @@ configure() {
     done
 }
 
-# Main execution
-require_packages
 configure
 EOF
 
