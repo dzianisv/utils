@@ -1,0 +1,13 @@
+#!/bin/bash
+hosts=""
+domain="%1"
+
+for _ in {1..32}; do
+    ip=$(dig +short @8.8.8.8 "$domain")
+    if expr "$hosts" : ".*$ip.*" > /dev/null; then
+        continue
+    fi
+    hosts+=" $ip"
+done
+
+echo "$hosts"
