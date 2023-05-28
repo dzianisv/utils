@@ -27,10 +27,9 @@ EOF
 fi
 
 CRON_JOB_PATH="/etc/crontabs/root"
-INTERVAL=$(( 10 * 60 )) # seconds
-# Create the cron job file
+# Create the cron job to run script each 10m
 cat <<EOF >> "$CRON_JOB_PATH"
-*/$INTERVAL * * * * $SCRIPT_PATH
+*/10 * * * * $SCRIPT_PATH
 EOF
 
 # Set permissions for the cron job file

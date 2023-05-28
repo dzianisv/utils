@@ -69,12 +69,9 @@ EOF
 # Set permissions for the installation script
 chmod +x "$SCRIPT_PATH"
 
-
-# Set the desired interval in seconds
-INTERVAL=$(( 5 * 60 ))
-# Create the cron job file
-cat <<EOF > "$CRON_JOB_PATH"
-*/$INTERVAL * * * * $SCRIPT_PATH >/dev/null 2>&1
+# Run script each 5m
+cat <<EOF >> "$CRON_JOB_PATH"
+*/5 * * * * $SCRIPT_PATH
 EOF
 
 # Set permissions for the cron job file
