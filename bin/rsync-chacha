@@ -1,0 +1,3 @@
+#!/bin/sh
+
+exec rsync -rtl --inplace --update --progress --human-readable -e "ssh -c chacha20-poly1305@openssh.com"$*

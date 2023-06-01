@@ -11,7 +11,7 @@ cat << 'EOF' > "$SCRIPT_PATH"
 
 # Define the path to the mount directory
 MOUNT_DIRECTORY="$HOME/.mnt"
-CONFIG_DIRECTORy="$HOME/.config/automount"
+CONFIG_DIRECTORY="$HOME/.config/automount"
 mkdir -p "$MOUNT_DIRECTORY"
 
 # Function to mount the encrypted folder
