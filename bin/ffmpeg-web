@@ -1,8 +1,18 @@
 #!/bin/sh
 set -xe
 
+send_notification() {
+    title=$1
+    message=$2
+    if command -v terminal-notifier; then
+        terminal-notifier -title "$title" -message "$message"
+    elif command -v notify-send; then
+        notify-send "$message"
+    fi
+}
+
 for input in "$@"; do
     out=/tmp/$(basename "${input%.*}").mp4
     ffmpeg -i "$input" -c:v h264 -crf 30 -s 1920x1080 "$out"
-    notify-send "$out is ready"
+    send_notification "$0" "$out is ready"
 done
