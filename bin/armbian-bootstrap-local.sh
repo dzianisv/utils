@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-if ! command resilio-sync; then
+if [ -n "$INSTALL_RESILIO_SYNC" ] && ! command resilio-sync; then
     curl "https://download-cdn.resilio.com/2.7.3.1381/Debian/resilio-sync_2.7.3.1381-1_armhf.deb" > /tmp/resilio-sync.deb
     apt install -yq /tmp/resilio-sync.deb
     systemctl enable --now resilio-sync
