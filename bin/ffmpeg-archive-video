@@ -3,14 +3,17 @@ set -e
 
 for SRC in $*; do
     BASENAME=$(basename "$SRC")
+    DIRNAME=$(dirname "$SRC")
     NAME=${BASENAME%.*}
     EXT=${BASENAME##*.}
-    
-    JUNK="$(dirname "$SRC")/Junk"
-    DST="$NAME-HEVC.$EXT"
 
-    mkdir -p "$JUNK"
-    ffmpeg -i "$SRC" -c:v hevc -crf 23 -c:a aac "$DST"
+    JUNK_DIR="$DIRNAME/Junk"
+    DST=".$NAME.mp4"
+
+    mkdir -p "$JUNK_DIR"
+    ffmpeg -i "$SRC" -c:v libaom-av1 -quality good -crf 23  -c:a libopus "$DST"
     touch -r "$SRC" "$DST"
-    mv "$SRC" "$JUNK/"
+    mv "$SRC" "$JUNK_DIR/"
+    # remove `.` prefix
+    mv "$DST" "$NAME.mp4"
 done
