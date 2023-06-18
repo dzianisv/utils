@@ -11,7 +11,12 @@ for SRC in $*; do
     DST=".$NAME.mp4"
 
     mkdir -p "$JUNK_DIR"
-    ffmpeg -i "$SRC" -c:v libaom-av1 -quality good -crf 23  -c:a libopus "$DST"
+
+    if ffprobe -v quiet -show_entries stream=codec_name "$SRC" | grep -q av1; then
+        continue
+    fi
+
+    ffmpeg -i "$SRC" -c:v libaom-av1 -quality good -crf 20  -c:a libopus "$DST"
     touch -r "$SRC" "$DST"
     mv "$SRC" "$JUNK_DIR/"
     # remove `.` prefix
