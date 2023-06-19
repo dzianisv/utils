@@ -7,4 +7,5 @@ name=$(uuidgen)
 
 ssh-copy-id "$host"
 scp "${script}" "${host}":/tmp/$name
-ssh "${host}" sh -c "bash /tmp/$name; rm /tmp/$name"
+ssh "${host}" bash "/tmp/$name"
+ssh "${host}" bash -c "rm '/tmp/$name'"
