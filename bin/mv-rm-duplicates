@@ -8,6 +8,11 @@ set -ueo pipefail
 
 DST_DIR=$(readlink -f $1)
 
+
+get_file_modification_time() {
+    date -r $(stat -f %m "$$1" 2>/dev/null) +"%Y-%m-%d-%H-%M-%S"
+}
+
 if [[ ! -d "${DST_DIR}" ]]; then
     echo "Directory ${DST_DIR} doesn't exist"
     exit 1
@@ -39,7 +44,8 @@ for file in *; do
     else
         file_ext=${file##*.}
         file_name=${file%.*}
-        unique_dst_file="${DST_DIR}/${file_name}-1.${file_ext}"
+        file_modification_time=$(get_file_modification_time "${src_file}")
+        unique_dst_file="${DST_DIR}/${file_name}-${file_modification_time}.${file_ext}"
 
         if [[ ! -f "$unique_dst_file" ]]; then
             mv "$src_file" "$unique_dst_file"
