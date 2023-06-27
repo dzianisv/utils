@@ -53,12 +53,7 @@ scan_and_mount() {
 }
 
 # Get the disk path and label from the launchd environment variables
-disk_path="$1"
-
-if [ -z "$disk_path" ]; then
-    echo "No disk path provided"
-    exit 1
-fi
+disk_path="${1:-/Volumes/}"
 
 scan_and_mount "$disk_path"
 EOF
