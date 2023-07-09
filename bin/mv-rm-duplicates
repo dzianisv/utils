@@ -10,7 +10,7 @@ DST_DIR=$(readlink -f $1)
 
 
 get_file_modification_time() {
-    date -r $(stat -f %m "$$1" 2>/dev/null) +"%Y-%m-%d-%H-%M-%S"
+    date -r $(stat -f %m "$1" 2>/dev/null) +"%Y-%m-%d-%H-%M-%S"
 }
 
 if [[ ! -d "${DST_DIR}" ]]; then

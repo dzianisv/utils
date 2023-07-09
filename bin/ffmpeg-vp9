@@ -3,5 +3,5 @@
 for i in $*; do
     name=$(basename "$i")
     name=${name%.*}
-    ffmpeg -i "$i" -c:v vp9 -quality good -crf 31 -c:a libopus  "$name.webm"
+    ffmpeg -i "$i" -c:v vp9 -quality good -crf 31 -c:a libopus  "$name.mp4"
 done

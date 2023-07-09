@@ -4,7 +4,7 @@ if ! command -v qemu-system-x86_64 2> /dev/null; then
   brew install qemu
 fi
 
-ISO=~/Downloads/Win10_*.iso
+ISO=${1:?ISO disk is not set}
 DISK=/dev/disk3
 
 for d in ${DISK}*; do
@@ -12,10 +12,9 @@ for d in ${DISK}*; do
 done
 
 qemu-system-x86_64 \
-  -m 4096 \
+  -m 8096 \
   -usb \
   -device usb-tablet \
-  -boot d \
   -monitor stdio \
   -device intel-hda \
   -machine type=q35,accel=hvf \
