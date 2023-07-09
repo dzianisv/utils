@@ -1,5 +1,9 @@
 #!/bin/sh
 
+# This script creates a .CUBE LUT previews from image $SRC
+# Usage ./photo-preview-lut.sh *.cube
+# It will create file .jpg preview for each .CUBE file
+
 LUT_INTENSITY=1.0
 
 if ! command -v dcraw || ! command -v ffmpeg; then

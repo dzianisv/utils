@@ -1,5 +1,9 @@
 #!/bin/sh
 
+# This script applies $LUT to all the RAW photos
+# Usage: LUT=myStyle.cube ./photo-apply-lut.sh *.ARW
+# It will apply lut and create .JPG file for each input RAW photo with the same name
+
 LUT_INTENSITY=0.25
 
 if ! command -v dcraw || ! command -v ffmpeg; then
