@@ -39,8 +39,8 @@ uci set dhcp.privateLan.leasetime='12h'
 # # /etc/config/wireless
 # uci set wireless.wifinet1.network="$PRIVATE_NETWORK_INTERFACE_NAME"
 
-# uci commit dhcp
-# uci commit network
+uci commit dhcp
+uci commit network
 
 if ! grep "$PRIVATE_NETWORK_TABLE" < /etc/iproute2/rt_tables; then
     echo "100 $PRIVATE_NETWORK_TABLE" >> /etc/iproute2/rt_tables
@@ -51,36 +51,29 @@ if ! command -v curl; then
 	opkg install -y curl
 fi
 
-cat << EOF > /etc/hotplug.d/iface/common
-WAN_INTERFACE=$WAN_INTERFACE
-OPENWRT_WAN_INTERFACE=\${WAN_INTERFACE##*-}
-PRIVATE_NETWORK_INTERFACE=$PRIVATE_NETWORK_INTERFACE
-PRIVATE_NETWORK_INTERFACE_ADDRESS=$PRIVATE_NETWORK
-PRIVATE_NETWORK_TABLE=$PRIVATE_NETWORK_TABLE
-LOG_FILE=/tmp/hotplug-iface.log
+cat << 'EOF' > /etc/hotplug.d/iface/functions
+
+function get_gateway_dev_from_routing_table() {
+	ip route show | grep default | tail -n 1 | awk '{print $5}'
+}
+
+function get_gateway_ip_from_routing_table() {
+	ip route show | grep default | tail -n 1 | awk '{print $3}'
+}
 
 log() {
-	echo "\$(date -Ins) \$@" >> "\$LOG_FILE"
+	echo "$(date -Ins) $@" >> "$LOG_FILE"
 }
 
 exec_log() {
-	log "\$@"
-	"\$@"
+	log "$@"
+	"$@"
 }
 
 resolve_ip() {
-  domain=\$1
-  nslookup \$domain 1.1.1.1 | awk '/^Address: / { print \$2 }' | tail -n1
+  domain=$1
+  nslookup $domain 1.1.1.1 | awk '/^Address: / { print $2 }' | tail -n1
 }
-
-EOF
-
-cat << 'EOF' > /etc/hotplug.d/iface/99-privateNetwork
-#!/bin/sh
-source "/etc/hotplug.d/iface/common"
-set -uo pipefail
-
-log $ACTION $INTERFACE
 
 function get_network() {
     ip=$1
@@ -104,6 +97,26 @@ function get_network() {
     echo $new_ip
 }
 
+EOF
+
+cat << EOF > /etc/hotplug.d/iface/common
+source /etc/hotplug.d/iface/functions
+WAN_INTERFACE=\$(get_gateway_dev_from_routing_table)
+WAN_GATEWAY=\$(get_gateway_ip_from_routing_table)
+PRIVATE_NETWORK_INTERFACE=$PRIVATE_NETWORK_INTERFACE
+PRIVATE_NETWORK_INTERFACE_ADDRESS=$PRIVATE_NETWORK
+PRIVATE_NETWORK_TABLE=$PRIVATE_NETWORK_TABLE
+LOG_FILE=/tmp/hotplug-iface.log
+EOF
+
+cat << 'EOF' > /etc/hotplug.d/iface/99-privateNetwork
+#!/bin/sh
+source "/etc/hotplug.d/iface/common"
+
+set -uo pipefail
+
+log $ACTION $INTERFACE
+
 if [ ! "$ACTION" = "ifup" ]; then
     exit 0
 fi
@@ -116,8 +129,8 @@ if [[ "$INTERFACE" = ${PRIVATE_NETWORK_INTERFACE##*-}  ]]; then
     exec_log ip route add "$network" dev "$PRIVATE_NETWORK_INTERFACE" table $PRIVATE_NETWORK_TABLE || :
 fi
 
-if [[ "$INTERFACE" = ${WAN_INTERFACE##*-} ]]; then
-	exec_log ip route add default dev "$WAN_INTERFACE" table $PRIVATE_NETWORK_TABLE metrci 500 || :
+if [[ "$INTERFACE" =~ wwan ]]; then
+	exec_log ip route add default via "$WAN_GATEWAY" dev "$WAN_INTERFACE" table $PRIVATE_NETWORK_TABLE metric 500 || :
 
 	bypass_hosts=""
 	for bypass_domain in kufar.by; do
@@ -127,13 +140,13 @@ if [[ "$INTERFACE" = ${WAN_INTERFACE##*-} ]]; then
 				continue
 			fi
 			bypass_hosts="$bypass_hosts $ip"
-			exec_log ip route add "$ip" dev "$WAN_INTERFACE" table $PRIVATE_NETWORK_TABLE || ::
+			exec_log ip route add "$ip" via "$WAN_GATEWAY" dev "$WAN_INTERFACE" table $PRIVATE_NETWORK_TABLE || ::
 		done
 	done
 
 	bypass_networks=$(curl https://noc.datahata.by/free.txt)
 	for network in $bypass_networks; do
-    	exec_log ip route add "$network" dev "$WAN_INTERFACE" table $PRIVATE_NETWORK_TABLE  2> /dev/null
+    	exec_log ip route add "$network" via "$WAN_GATEWAY" dev "$WAN_INTERFACE" table $PRIVATE_NETWORK_TABLE  2> /dev/null
 	done
 fi
 EOF
@@ -142,6 +155,7 @@ chmod a+x /etc/hotplug.d/iface/99-privateNetwork
 
 cat << 'EOF' > /etc/hotplug.d/iface/99-wireguard
 #!/bin/sh
+
 source "/etc/hotplug.d/iface/common"
 
 if [[ ! "$INTERFACE" =~ ^wg.*$ ]]; then
