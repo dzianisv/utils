@@ -10,7 +10,6 @@
 set -eu
 
 # Confiugre the WAN interface, 3g network interface is used by default
-WAN_INTERFACE=3g-3g
 PRIVATE_NETWORK_INTERFACE_NAME="privateLan"
 PRIVATE_NETWORK_INTERFACE=br-privateLan # TODO: read from the /etc/config/networks
 PRIVATE_NETWORK=192.168.64.1/24
@@ -18,8 +17,8 @@ PRIVATE_NETWORK_TABLE=$PRIVATE_NETWORK_INTERFACE_NAME
 
 # network routing rules will be added to this PRIVATE_NETWORK_TABLE
 
-# uci add_list firewall.cfg02dc81.network='lan'
-# uci add_list firewall.cfg02dc81.network="$PRIVATE_NETWORK_INTERFACE_NAME"
+uci add_list firewall.cfg02dc81.network='lan'
+uci add_list firewall.cfg02dc81.network="$PRIVATE_NETWORK_INTERFACE_NAME"
 
 # # /etc/config/network
 uci set network.privateLan=interface
@@ -39,8 +38,10 @@ uci set dhcp.privateLan.leasetime='12h'
 # # /etc/config/wireless
 # uci set wireless.wifinet1.network="$PRIVATE_NETWORK_INTERFACE_NAME"
 
+uci commit firewall
 uci commit dhcp
 uci commit network
+
 
 if ! grep "$PRIVATE_NETWORK_TABLE" < /etc/iproute2/rt_tables; then
     echo "100 $PRIVATE_NETWORK_TABLE" >> /etc/iproute2/rt_tables
