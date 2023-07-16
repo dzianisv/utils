@@ -43,7 +43,6 @@ chmod a+x "$WATCHDOG_SCRIPT"
 # Define the cron job line
 CRON_JOB="*/1 * * * * $WATCHDOG_SCRIPT"
 
-CRONTAB=
 if  [[ ! "$(crontab -l)" =~ $WATCHDOG_SCRIPT ]] ; then
     # Append the cron job line to the current user's crontab
     (crontab -l 2>/dev/null; echo "$CRON_JOB" ) | crontab -
