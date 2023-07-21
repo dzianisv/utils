@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 if ! command -v curl; then
     opkg update
@@ -8,7 +8,7 @@ fi
 WATCHDOG_SCRIPT=/usr/bin/watchdog.sh
 
 cat << 'EOF' > "$WATCHDOG_SCRIPT"
-#!/bin/bash
+#!/bin/sh
 set -euo pipefail
 
 watchdog_file=/var/run/watchdog
