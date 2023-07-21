@@ -4,11 +4,8 @@ import os
 import re
 import logging
 import sys
-from PIL import Image
+import subprocess
 
-"""
-$ pip install pillow
-"""
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.DEBUG)
@@ -16,16 +13,9 @@ logger.addHandler(logging.StreamHandler(sys.stderr))
 
 def optimize_image(png_path, quality=70):
     output_path = re.sub(r'\.(png|jpg)$', '.webp', png_path)
-    try:
-        img = Image.open(png_path).convert("RGBA")
-        rgb_img = img.convert('RGB')
-        rgb_img.save(output_path, 'WEBP', quality=70)
-        logger.info('Converted "%s" -> "%s"', png_path, output_path)
-        return output_path
-    except Exception as e:
-        logger.error(f"Error: Unable to convert file {png_path} to JPG. Error: {e}")
-        return None
-
+    cmd = ["convert", png_path, "-quality", str(quality), output_path]
+    subprocess.check_call(cmd)
+    return output_path
 
 def replace_png_with_jpg(file_path):
     with open(file_path, 'r') as file:
