@@ -163,7 +163,7 @@ if [[ ! "$INTERFACE" =~ ^wg.*$ ]]; then
 	exit 0
 fi
 
-gateway=$(uci get network.$INTERFACE.gateway)
+gateway=$(uci get network.$INTERFACE.gateway || uci get network.$INTERFACE.dns)
 
 if [ -z "$gateway" ]; then
 	echo "Gateway for $INTERFACE is not set. Example: uci set network.$INTERFACE.gateway=10.0.0.1 && uci commit network" >&2

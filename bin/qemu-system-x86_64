@@ -4,14 +4,20 @@ if ! command -v qemu-system-x86_64 2> /dev/null; then
   brew install qemu
 fi
 
-ISO=${1:?ISO disk is not set}
-DISK=/dev/disk3
+
+DISK=${1:?usage $0 /dev/disk2 ~/Downloads/disk.iso}
+ISO=${2:-}
 
 for d in ${DISK}*; do
   diskutil unmount "$d"
 done
 
-qemu-system-x86_64 \
+args=""
+if [[ -n "$ISO" ]]; then
+  args="$args -boot d -cdrom $ISO"
+fi
+
+exec qemu-system-x86_64 \
   -m 8096 \
   -usb \
   -device usb-tablet \
@@ -19,5 +25,5 @@ qemu-system-x86_64 \
   -device intel-hda \
   -machine type=q35,accel=hvf \
   -cpu Haswell \
-  -cdrom "$ISO" \
   -hda "$DISK" \
+  $args
