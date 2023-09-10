@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-LUT_INTENSITY=${LUT_INTENSITY:-0.75}
+LUT_INTENSITY=${LUT_INTENSITY:-0.60}
 
 if ! command -v dcraw || ! command -v ffmpeg; then
     brew install dcraw ffmpeg

@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# Check if ffmpeg is installed
+if ! command -v ffmpeg &> /dev/null; then
+    echo "Error: ffmpeg is not installed. Please install it first."
+    exit 1
+fi
+
+# Check for input arguments
+if [ "$#" -eq 0 ]; then
+    echo "Usage: $0 <input1.mp4> <input2.mp4> ..."
+    exit 1
+fi
+
+# Loop over all input files
+for input_file in "$@"; do
+    # Determine the output file name (same as input but in the current directory)
+    output_file="$(basename "$input_file")"
+
+    # Perform the conversion using ffmpeg
+    ffmpeg -i "$input_file" -c:v copy -c:a aac "$output_file"
+
+    echo "Processed: $input_file -> $output_file"
+done
