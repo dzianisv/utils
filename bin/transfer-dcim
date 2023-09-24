@@ -1,0 +1,89 @@
+#!/bin/bash
+# Merges current workdir to the $1 dir (Destination Directory)
+# Duplicate files (files with the same hash sum) will be remove from the Working Directory
+# Files with the same file_name will be refile_named and moved to the Destination Directory
+# Unique files will be moved from the Working Directory to the Destination Directory
+
+set -ueo pipefail
+
+
+MEDIA_DIRS=("PRIVATE/M4ROOT/CLIP", "DCIM/100MSDCF")
+MEDIA_EXTENSIONS=("*.MP4", "*.JPG", "*.ARW")
+TMP_EXTENSIONS=("*.THM", "*.XML")
+
+get_file_modification_time() {
+    date -r $(stat -f %m "$1" 2>/dev/null) +"%Y-%m-%d-%H-%M-%S"
+}
+
+mv-remove-duplicates() {
+    DST_DIR=$(readlink -f $1)
+    shift
+    FILES=$@
+
+    if [[ ! -d "${DST_DIR}" ]]; then
+        echo "Directory ${DST_DIR} doesn't exist"
+        exit 1
+    fi
+
+    for file in $FILES; do
+        dst_file="${DST_DIR}/${file}"
+        src_file="${file}"
+
+        if [[ ! -f "${src_file}" ]]; then
+            echo "Skip ${src_file}. Not a file"
+            continue
+        fi
+
+        if [[ ! -f "${dst_file}" ]]; then
+            echo "${dst_file} doesn't exist, moving ${src_file} to ${dst_file}"
+            mv "${src_file}" "${DST_DIR}/"
+            continue
+        fi
+
+        if cmp -s "${src_file}" "${dst_file}"; then
+            echo "${src_file} duplicates ${dst_file}"
+            rm "${src_file}"
+        else
+            file_ext=${file##*.}
+            file_name=${file%.*}
+            file_modification_time=$(get_file_modification_time "${src_file}")
+            unique_dst_file="${DST_DIR}/${file_name}-${file_modification_time}.${file_ext}"
+
+            if [[ ! -f "$unique_dst_file" ]]; then
+                mv "$src_file" "$unique_dst_file"
+                echo "Moving $src_file to $unique_dst_file"
+            else
+                echo "File $unique_dst_file exists"
+                continue
+            fi
+        fi
+    done
+}
+
+transfer() {
+    TARGET_DIR=${1:?Target directory is required}
+
+    if [ ! -d "$TARGET_DIR" ]; then
+        echo "Target directory $TARGET_DIR doesn't exist"
+        exit 1
+    fi
+
+    for VOLUME in /Volumes/*; do
+        if [[ -d "${VOLUME}" ]]; then
+            for DIR in "${MEDIA_DIRS[@]}"; do
+                SRC_DIR="${VOLUME}/${DIR}"
+                if [[ -d "${SRC_DIR}" ]]; then
+                    for EXT in "${MEDIA_EXTENSIONS[@]}"; do
+                        mv-remove-duplicates "${TARGET_DIR}" "${SRC_DIR}"/*."${EXT}"
+                    done
+
+                    for TMP_EXTENSION in "${TMP_EXTENSIONS[@]}"; do
+                        rm "${SRC_DIR}"/*."${TMP_EXTENSION}"
+                    done
+                fi
+            done
+        fi
+    done
+}
+
+tranfer "$1"
