@@ -48,6 +48,7 @@ scan_and_mount() {
     done
 }
 
-# Get the disk path and label from the launchd environment variables
-disk_path="${1:-$MOUNT_DIRECTORY}"
-scan_and_mount "$disk_path"
+
+mount | awk '{print $3}' | while read mountpoint; do
+    scan_and_mount "$mountpoint"
+done
