@@ -41,7 +41,7 @@ scan_and_mount() {
     fi
 
     # Find all gocryptfs filesystems in the root folders of the disk
-    local gocryptfs_configs=$(find "$disk_path" -maxdepth 3 -name "gocryptfs.conf")
+    local gocryptfs_configs=$(find "$disk_path" -maxdepth 2 -name "gocryptfs.conf")
     for gocryptfs_config in $gocryptfs_configs; do
         local encrypted_folder=$(dirname $gocryptfs_config)
         mount_encrypted_folder "$encrypted_folder"
