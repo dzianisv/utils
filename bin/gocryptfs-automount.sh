@@ -22,8 +22,11 @@ mount_encrypted_folder() {
         return 1
     fi
 
+    mkdir -p "$MOUNT_DIRECTORY/$name"
     # Mount the encrypted folder
-    if cat < $password_file | gocryptfs "$folder_path" "$MOUNT_DIRECTORY/$name"; then
+    local password=$(cat "$password_file" || echo ${PASSWORD})
+
+    if echo "$password" | gocryptfs "$folder_path" "$MOUNT_DIRECTORY/$name"; then
         echo "Mounted encrypted folder: $folder_path"
     else
         echo "Failed to mount encrypted folder: $folder_path"
