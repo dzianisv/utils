@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Create the systemd service file
+cat <<EOL | sudo tee /etc/systemd/system/gocryptfs-automount.service
+[Unit]
+Description=gocryptfs automount service
+
+[Service]
+ExecStart=/usr/local/bin/gocryptfs-automount.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+# Reload the systemd daemon to recognize the new service
+sudo systemctl daemon-reload
+
+# Enable the service to start on boot
+sudo systemctl enable gocryptfs-automount.service
+
+# Start the service immediately
+sudo systemctl start gocryptfs-automount.service
+
+echo "gocryptfs-automount service installed and started!"
