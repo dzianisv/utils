@@ -41,13 +41,15 @@ def cleanup_markdown(file_path):
         image_uri, image_ext = image_tag
 
         path = os.path.join(os.path.dirname(file_path), image_uri)
-
-        logger.debug('found image path "%s"', path)
+        logger.debug('found an image "%s"', path)
         if os.path.exists(path):  # checks if the png file exists
             new_path = None
 
             # move the image to the img folder if it is not already there
-            if not path.startswith('./img'):
+            absolute_path = os.path.realpath(os.path.join(os.path.dirname(file_path), image_uri))
+            img_dir = os.path.realpath(img_folder)
+
+            if not absolute_path.startswith(img_dir):
                 new_path = unify_images(path)
 
             # convert only png and jpg images
