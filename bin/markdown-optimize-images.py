@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+"""
+processes markdown files, moving images to a unified "img" folder, converts PNG and JPG images to WEBP format for optimization, and updates markdown image references accordingly
+"""
+
 import os
 import re
 import logging
