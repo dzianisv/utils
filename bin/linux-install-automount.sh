@@ -19,11 +19,11 @@ fi
 # 1. Write the shell script into /usr/local/bin/udisk-automount.sh
 cat > /usr/local/bin/udisk-automount.sh << 'EOL'
 #!/bin/bash
-block_devices=$(lsblk -o NAME,TYPE,MOUNTPOINT | grep "disk" | awk '{print $1}')
-for device in $block_devices; do
-    mountpoint=$(lsblk -o NAME,MOUNTPOINT | grep "^$device" | awk '{print $2}')
+lsblk -o PATH,MOUNTPOINT | while read -r device_path mountpoint; do
+    # Check if the mountpoint is empty
     if [ -z "$mountpoint" ]; then
-        udisksctl mount -b /dev/$device
+        # Mount the device using udisksctl
+        udisksctl mount -b "$device_path"
     fi
 done
 EOL
