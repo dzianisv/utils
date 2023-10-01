@@ -15,49 +15,11 @@ get_file_modification_time() {
     date -r $(stat -f %m "$1" 2>/dev/null) +"%Y-%m-%d-%H-%M-%S"
 }
 
-mv-remove-duplicates() {
-    DST_DIR=$(readlink -f $1)
+transfer() {
+    destination=$1
     shift
-    FILES=$@
 
-    if [[ ! -d "${DST_DIR}" ]]; then
-        echo "Directory ${DST_DIR} doesn't exist"
-        exit 1
-    fi
-
-    for file in $FILES; do
-        dst_file="${DST_DIR}/${file}"
-        src_file="${file}"
-
-        if [[ ! -f "${src_file}" ]]; then
-            echo "Skip ${src_file}. Not a file"
-            continue
-        fi
-
-        if [[ ! -f "${dst_file}" ]]; then
-            echo "${dst_file} doesn't exist, moving ${src_file} to ${dst_file}"
-            mv "${src_file}" "${DST_DIR}/"
-            continue
-        fi
-
-        if cmp -s "${src_file}" "${dst_file}"; then
-            echo "${src_file} duplicates ${dst_file}"
-            rm "${src_file}"
-        else
-            file_ext=${file##*.}
-            file_name=${file%.*}
-            file_modification_time=$(get_file_modification_time "${src_file}")
-            unique_dst_file="${DST_DIR}/${file_name}-${file_modification_time}.${file_ext}"
-
-            if [[ ! -f "$unique_dst_file" ]]; then
-                mv "$src_file" "$unique_dst_file"
-                echo "Moving $src_file to $unique_dst_file"
-            else
-                echo "File $unique_dst_file exists"
-                continue
-            fi
-        fi
-    done
+    rsync -r -t l --progress=status -e "ssh -o Ciphers=chacha20-poly1305@openssh.com" --remove-source-files "$*" "${destination}"
 }
 
 transfer() {
@@ -74,7 +36,7 @@ transfer() {
                 SRC_DIR="${VOLUME}/${DIR}"
                 if [[ -d "${SRC_DIR}" ]]; then
                     for EXT in "${MEDIA_EXTENSIONS[@]}"; do
-                        mv-remove-duplicates "${TARGET_DIR}" "${SRC_DIR}"/*."${EXT}"
+                        transfer "${TARGET_DIR}" "${SRC_DIR}"/*."${EXT}"
                     done
 
                     for TMP_EXTENSION in "${TMP_EXTENSIONS[@]}"; do
