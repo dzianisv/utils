@@ -1,55 +1,72 @@
 #!/bin/bash
-# Merges current workdir to the $1 dir (Destination Directory)
-# Duplicate files (files with the same hash sum) will be remove from the Working Directory
-# Files with the same file_name will be refile_named and moved to the Destination Directory
-# Unique files will be moved from the Working Directory to the Destination Directory
 
 set -ueo pipefail
 
+MEDIA_DIRS=("PRIVATE/M4ROOT/CLIP" "DCIM/100MSDCF")
+MEDIA_EXTENSIONS=("*.MP4" "*.JPG" "*.ARW")
+TMP_EXTENSIONS=("*.THM" "*.XML")
 
-MEDIA_DIRS=("PRIVATE/M4ROOT/CLIP", "DCIM/100MSDCF")
-MEDIA_EXTENSIONS=("*.MP4", "*.JPG", "*.ARW")
-TMP_EXTENSIONS=("*.THM", "*.XML")
+get_os() {
+    case "$(uname)" in
+        Darwin) echo "macos" ;;
+        Linux) echo "linux" ;;
+        *) echo "unknown" ;;
+    esac
+}
 
 get_file_modification_time() {
-    date -r $(stat -f %m "$1" 2>/dev/null) +"%Y-%m-%d-%H-%M-%S"
+    if [ "$(get_os)" = "macos" ]; then
+        date -r $(stat -f %m "$1" 2>/dev/null) +"%Y-%m-%d-%H-%M-%S"
+    else
+        date -r $(stat -c %Y "$1" 2>/dev/null) +"%Y-%m-%d-%H-%M-%S"
+    fi
 }
 
 transfer() {
-    destination=$1
+    destination="$1"
     shift
-    rsync -r -t l --progress=status -e "ssh -o Ciphers=chacha20-poly1305@openssh.com" --remove-source-files "$*" "${destination}"
+    rsync -r -t -l --progress -e "ssh -o Ciphers=chacha20-poly1305@openssh.com" --remove-source-files "$@" "${destination}"
 }
 
 automount() {
-    lsblk -o PATH,MOUNTPOINT | while read -r device_path mountpoint; do
-        # Check if the mountpoint is empty
-        if [ -z "$mountpoint" ]; then
-            # Mount the device using udisksctl
-            udisksctl mount -b "$device_path"
-        fi
-    done
+    if [ "$(get_os)" = "macos" ]; then
+        for device_path in $(diskutil list | grep -E '^\s*/dev/' | awk '{print $1}'); do
+            mount_point=$(diskutil info "$device_path" | grep "Mount Point" | awk '{print $3}')
+            if [ -z "$mount_point" ]; then
+                diskutil mount "$device_path"
+            fi
+        done
+    else
+        lsblk -o PATH,MOUNTPOINT | while read -r device_path mountpoint; do
+            if [ -z "$mountpoint" ]; then
+                udisksctl mount -b "$device_path"
+            fi
+        done
+    fi
 }
 
 detect_and_transfer() {
-    TARGET_DIR=${1:?Target directory is required}
+    DESTINATION=${1:?Target directory is required}
 
-    if [ ! -d "$TARGET_DIR" ]; then
-        echo "Target directory $TARGET_DIR doesn't exist"
-        exit 1
+    if [[ $(get_os) = "macos" ]]; then
+        mountpoints=$(find -x /Volumes -maxdepth 1 -type d -not -path "/Volumes")
+    else
+        mountpoints=$(lsblk -o MOUNTPOINT)
     fi
 
-    lsblk -o PATH,MOUNTPOINT | while read -r device_path mountpoint; do
+    for mountpoint in $mountpoints; do
         if [[ -d "${mountpoint}" ]]; then
             for DIR in "${MEDIA_DIRS[@]}"; do
-                SRC_DIR="${mountpoint}/${DIR}"
+                SRC_DIR="${mountpoint%/}/${DIR}"
                 if [[ -d "${SRC_DIR}" ]]; then
                     for EXT in "${MEDIA_EXTENSIONS[@]}"; do
-                        transfer "${TARGET_DIR}" "${SRC_DIR}"/*."${EXT}"
+                        echo "Staring transfer of ${SRC_DIR}/${EXT} to ${DESTINATION}"
+                        if ! transfer "${DESTINATION}" "${SRC_DIR}/"${EXT}; then
+                            echo "Failed to transfer ${SRC_DIR}/${EXT}"
+                        fi
                     done
-
                     for TMP_EXTENSION in "${TMP_EXTENSIONS[@]}"; do
-                        rm "${SRC_DIR}"/*."${TMP_EXTENSION}"
+                        find "${SRC_DIR}" -maxdepth 1 -type f -name "${TMP_EXTENSION}" -exec rm {} \;
                     done
                 fi
             done
