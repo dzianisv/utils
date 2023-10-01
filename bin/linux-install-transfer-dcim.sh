@@ -11,7 +11,7 @@ Description=Transfer DCIM Service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'while IFS= read -r destination; do /usr/local/bin/transfer-dcim "$destination"; done < /etc/transfer-dcim.txt'
+ExecStart=/bin/bash -c 'while IFS= read -r destination; do /usr/local/bin/transfer-dcim "$destination/$(date "+%Y-%m-%d")"; done < /etc/transfer-dcim.txt'
 EOL
 
 # Create the systemd timer file
