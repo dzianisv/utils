@@ -79,15 +79,22 @@ detect_and_transfer() {
     done
 }
 
+from_config() {
+    config=${1:?Config file is required}
 
-if [[ -f "$1" ]]; then
-    # configration file is passed
-    for line in $(< "$1"); do
+    for line in $(< "$config"); do
         if [[ "$line" =~ ^# ]]; then
             continue
         fi
         detect_and_transfer "$line/$(date +%Y-%m-%d)"
     done
+}
+
+if [[ $# == 0 ]]; then
+    from_config "$HOME/.config/transfer-dcim-destinations.txt"
+elif [[ -f "$1" ]]; then
+    # configration file is passed
+    from_config "$1"
 else
     detect_and_transfer "$*"
 fi

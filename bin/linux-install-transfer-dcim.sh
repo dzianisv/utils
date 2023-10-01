@@ -11,7 +11,7 @@ Description=Transfer DCIM Service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/transfer-dcim $HOME/.config/transfer-dcim-destinations.txt
+ExecStart=/usr/local/bin/transfer-dcim
 EOL
 
 # Create the systemd timer file
