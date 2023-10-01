@@ -25,6 +25,11 @@ get_file_modification_time() {
 transfer() {
     destination="$1"
     shift
+    if [[ ! -f "$1" ]]; then
+        echo "No files to transfer"
+        return 0
+    fi
+
     rsync -r -t -l --progress -e "ssh -o Ciphers=chacha20-poly1305@openssh.com" --remove-source-files "$@" "${destination}"
 }
 
