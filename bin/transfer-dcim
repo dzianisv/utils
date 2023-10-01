@@ -18,11 +18,20 @@ get_file_modification_time() {
 transfer() {
     destination=$1
     shift
-
     rsync -r -t l --progress=status -e "ssh -o Ciphers=chacha20-poly1305@openssh.com" --remove-source-files "$*" "${destination}"
 }
 
-transfer() {
+automount() {
+    lsblk -o PATH,MOUNTPOINT | while read -r device_path mountpoint; do
+        # Check if the mountpoint is empty
+        if [ -z "$mountpoint" ]; then
+            # Mount the device using udisksctl
+            udisksctl mount -b "$device_path"
+        fi
+    done
+}
+
+detect_and_transfer() {
     TARGET_DIR=${1:?Target directory is required}
 
     if [ ! -d "$TARGET_DIR" ]; then
@@ -30,10 +39,10 @@ transfer() {
         exit 1
     fi
 
-    for VOLUME in /Volumes/*; do
-        if [[ -d "${VOLUME}" ]]; then
+    lsblk -o PATH,MOUNTPOINT | while read -r device_path mountpoint; do
+        if [[ -d "${mountpoint}" ]]; then
             for DIR in "${MEDIA_DIRS[@]}"; do
-                SRC_DIR="${VOLUME}/${DIR}"
+                SRC_DIR="${mountpoint}/${DIR}"
                 if [[ -d "${SRC_DIR}" ]]; then
                     for EXT in "${MEDIA_EXTENSIONS[@]}"; do
                         transfer "${TARGET_DIR}" "${SRC_DIR}"/*."${EXT}"
@@ -48,4 +57,4 @@ transfer() {
     done
 }
 
-tranfer "$1"
+detect_and_transfer "$1"

@@ -13,6 +13,8 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOL
 
+install -m 0755 gocryptfs-automount.sh /usr/local/bin/gocryptfs-automount.sh
+
 # Reload the systemd daemon to recognize the new service
 systemctl daemon-reload
 
@@ -21,5 +23,3 @@ systemctl enable gocryptfs-automount.service
 
 # Start the service immediately
 systemctl start gocryptfs-automount.service
-
-echo "gocryptfs-automount service installed and started!"
