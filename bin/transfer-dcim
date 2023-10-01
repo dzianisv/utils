@@ -79,4 +79,15 @@ detect_and_transfer() {
     done
 }
 
-detect_and_transfer "$1"
+
+if [[ -f "$1" ]]; then
+    # configration file is passed
+    for line in $(< "$1"); do
+        if [[ "$line" =~ ^# ]]; then
+            continue
+        fi
+        detect_and_transfer "$line/$(date +%Y-%m-%d)"
+    done
+else
+    detect_and_transfer "$*"
+fi
