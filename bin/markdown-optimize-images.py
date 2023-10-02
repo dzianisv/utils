@@ -53,18 +53,18 @@ def cleanup_markdown(file_path):
             absolute_path = os.path.realpath(os.path.join(os.path.dirname(file_path), image_uri))
             img_dir = os.path.realpath(img_folder)
 
-            if not absolute_path.startswith(img_dir):
-                new_path = unify_images(path)
-
             # convert only png and jpg images
             if image_ext in set(['png', 'jpg']):
-                new_path = optimize_image(path if new_path is None else new_path)
+                new_path = optimize_image(path)
 
                 try:
                     os.remove(path)
                     logger.debug('removed "%s"', path)
                 except (OSError, PermissionError) as e:
                     logger.error(f"Error: Unable to remove file {path}: %s", e)
+            else:
+                if not absolute_path.startswith(img_dir):
+                    new_path = unify_images(path)
 
             if new_path is None:
                 continue

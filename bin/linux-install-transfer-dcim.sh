@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 1. Install the script from GitHub to /usr/local/bin/transfer-dcim
-curl -o /usr/local/bin/transfer-dcim "https://raw.githubusercontent.com/dzianisv/utils/129a00984b6247c7d49126b3f571e271184c9e17/bin/transfer-dcim"
+curl -o /usr/local/bin/transfer-dcim "https://raw.githubusercontent.com/dzianisv/utils/master/bin/transfer-dcim"
 chmod +x /usr/local/bin/transfer-dcim
 
 # Create the systemd service file

@@ -50,8 +50,23 @@ automount() {
     fi
 }
 
+ssh_host_is_accessible() {
+    remote_host=${1:?Remote host is required}
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote_host" exit 0 &>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 detect_and_transfer() {
     DESTINATION=${1:?Target directory is required}
+
+    local dst_host="${DESTINATION%%:*}"
+    if ! ssh_host_is_accessible "$dst_host"; then
+        echo "Destination host \"$dst_host\" is not accessible"
+        return 1
+    fi
 
     if [[ $(get_os) = "macos" ]]; then
         mountpoints=$(find -x /Volumes -maxdepth 1 -type d -not -path "/Volumes")
@@ -86,7 +101,7 @@ from_config() {
         if [[ "$line" =~ ^# ]]; then
             continue
         fi
-        detect_and_transfer "$line/$(date +%Y-%m-%d)"
+        detect_and_transfer "$line/$(date +%Y-%m-%d)/"
     done
 }
 
