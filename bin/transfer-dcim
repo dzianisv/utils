@@ -5,6 +5,11 @@ set -ueo pipefail
 MEDIA_DIRS=("PRIVATE/M4ROOT/CLIP" "DCIM/100MSDCF")
 MEDIA_EXTENSIONS=("*.MP4" "*.JPG" "*.ARW")
 TMP_EXTENSIONS=("*.THM" "*.XML")
+ARGS=""
+
+if [[ "${REMOVE_SOURCE_FILES:-}" == "yes" ]]; then
+    ARGS="$ARGS --remove-source-files"
+fi
 
 get_os() {
     case "$(uname)" in
@@ -30,7 +35,7 @@ transfer() {
         return 0
     fi
 
-    rsync -r -t -l --progress -e "ssh -o Ciphers=chacha20-poly1305@openssh.com" --remove-source-files "$@" "${destination}"
+    rsync -r -t -l --progress -e "ssh -o Ciphers=chacha20-poly1305@openssh.com" ${ARGS} "$@" "${destination}"
 }
 
 automount() {
