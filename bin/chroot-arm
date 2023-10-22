@@ -4,6 +4,10 @@ set -eu
 
 cd ${1:-.}
 
+if ! command -v qemu-arm-static 2> /dev/null; then
+	apt install qemu-user-static -yq
+fi
+
 install -m 0755 `command -v qemu-arm-static` usr/bin/qemu-arm-static
 trap "rm usr/bin/qemu-arm-static" EXIT
 
