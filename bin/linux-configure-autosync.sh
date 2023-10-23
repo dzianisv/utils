@@ -16,7 +16,23 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-touch /etc/autorsync.conf
+if [ ! -f  /etc/autorsync.conf ]; then
+  echo -n "Type in source path: "
+  read -r AUTORSYNC_SRC
+  echo -n "Type in destination path: "
+  read -r AUTORSYNC_DST
+  echo -n "Type in telegram bot token for notications: "
+  read -r TELEGRAM_BOT_TOKEN
+  echo -n "Type in telegram chat id for notications: "
+  read -r TELEGRAM_CHAT_ID
+
+cat << EOF > /etc/autorsync.conf
+AUTORSYNC_SRC=$AUTORSYNC_SRC
+AUTORSYNC_DST=$AUTORSYNC_DST
+TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID
+EOF
+fi
 
 cat << 'EOF' > /usr/local/bin/autorsync.sh
 #!/bin/bash
