@@ -2,9 +2,22 @@
 
 set -ueo pipefail
 
-MEDIA_DIRS=("PRIVATE/M4ROOT/CLIP" "DCIM/100MSDCF")
+# Arugments
+# DESTINATION_DIR=$(date +%Y-%m-%d)
+# REMOVE_SOURCE_FILES=no
+
+notify() {
+    echo "$*"
+
+    if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && "${TELEGRAM_CHAT_ID:-}"; then
+        TEXT=$(printf "%s" "$*" | jq -sRr @uri)
+        curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=$TELEGRAM_CHAT_ID&text=$TEXT"
+    fi
+}
+
+MEDIA_DIRS=("DCIM/100GOPRO" "PRIVATE/M4ROOT/CLIP"  "DCIM/100MSDCF" "private/M4ROOT/CLIP"  "DCIM/101MSDCF")
 MEDIA_EXTENSIONS=("*.MP4" "*.JPG" "*.ARW")
-TMP_EXTENSIONS=("*.THM" "*.XML")
+TMP_EXTENSIONS=("*.THM" "*.XML" "*.LRV")
 ARGS=""
 
 if [[ "${REMOVE_SOURCE_FILES:-}" == "yes" ]]; then
@@ -34,8 +47,9 @@ transfer() {
         echo "No files to transfer"
         return 0
     fi
-
-    rsync -r -t -l --progress -e "ssh -o Ciphers=chacha20-poly1305@openssh.com" ${ARGS} "$@" "${destination}"
+    ARGS=""
+    # ARGS="$ARGS --rsh=rsh"
+    rsync -r -t -l --progress -e "ssh -o Ciphers=chacha20-poly1305@openssh.com" "$@" "${destination}"
 }
 
 automount() {
@@ -88,6 +102,8 @@ detect_and_transfer() {
                         echo "Staring transfer of ${SRC_DIR}/${EXT} to ${DESTINATION}"
                         if ! transfer "${DESTINATION}" "${SRC_DIR}/"${EXT}; then
                             echo "Failed to transfer ${SRC_DIR}/${EXT}"
+                        else
+                            notify "Transfered ${SRC_DIR}/${EXT} to ${DESTINATION}"
                         fi
                     done
                     for TMP_EXTENSION in "${TMP_EXTENSIONS[@]}"; do
@@ -100,13 +116,14 @@ detect_and_transfer() {
 }
 
 from_config() {
-    config=${1:?Config file is required}
-
+    local config=${1:?Config file is required}
+    local dst_dir=${DESTINATION_DIR:-$(date +%Y-%m-%d)}
     for line in $(< "$config"); do
         if [[ "$line" =~ ^# ]]; then
             continue
         fi
-        detect_and_transfer "$line/$(date +%Y-%m-%d)/"
+
+        detect_and_transfer "$line/$dst_dir/"
     done
 }
 
