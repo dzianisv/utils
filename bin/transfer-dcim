@@ -20,7 +20,7 @@ MEDIA_EXTENSIONS=("*.MP4" "*.JPG" "*.ARW")
 TMP_EXTENSIONS=("*.THM" "*.XML" "*.LRV")
 ARGS=""
 
-if [[ "${REMOVE_SOURCE_FILES:-}" == "yes" ]]; then
+if [[ "${REMOVE_SOURCE_FILES:yes}" == "yes" ]]; then
     ARGS="$ARGS --remove-source-files"
 fi
 
