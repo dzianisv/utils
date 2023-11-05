@@ -1,15 +1,22 @@
-#!/bin/sh
+#!/bin/bash
 
 set -eu
 
 cd ${1:-.}
 
-if ! command -v qemu-arm-static 2> /dev/null; then
+
+if [[ $(file $(readlink -f bin/sh)) =~ aarch64 ]]; then
+    emu=qemu-aarch64-static
+else
+    emu=qemu-arm-static
+fi
+
+if ! command -v $emu 2> /dev/null; then
 	apt install qemu-user-static -yq
 fi
 
-install -m 0755 `command -v qemu-arm-static` usr/bin/qemu-arm-static
-trap "rm usr/bin/qemu-arm-static" EXIT
+install -m 0755 `command -v $emu` usr/bin/$emu
+trap "rm usr/bin/$emu" EXIT
 
 if ! mount | grep $(readlink -f dev); then
     mount -t devtmpfs none dev
@@ -26,4 +33,4 @@ if ! mount | grep $(readlink -f sys); then
     trap "umount sys" EXIT
 fi
 
-chroot . /usr/bin/qemu-arm-static /bin/sh -c "${2:-sh}"
+chroot . /usr/bin/$emu /bin/sh -c "${2:-sh}"
