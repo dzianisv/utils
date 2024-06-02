@@ -1,5 +1,11 @@
 #!/bin/bash
 
+
+if ! command -v gocryptfs; then
+  brew install --cask macfuse
+  brew install gromgit/fuse/gocryptfs-mac
+fi
+
 # Set the paths and filenames
 SCRIPT_PATH="/usr/local/bin/gocryptfs-automount.sh"
 PLIST_NAME="com.dzianisv.automount.plist"
