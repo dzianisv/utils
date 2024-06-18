@@ -9,12 +9,6 @@ if ! command -v brave-browser ; then
     apt update -yq && apt install -yq brave-browser
 fi 
 
-if ! command -v signal-desktop; then
-    curl -L "https://updates.signal.org/desktop/apt/keys.asc" | gpg2 --dearmor > "/usr/share/keyrings/signal-desktop-keyring.gpg"
-    echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/signal-desktop-keyring.gpg] https://updates.signal.org/desktop/apt xenial main' | tee -a /etc/apt/sources.list.d/signal-xenial.list
-    apt update -yq && apt install -yq signal-desktop
-fi
-
 if ! command -v session-desktop; then
     curl -Lo /tmp/session-desktop.deb "https://github.com/oxen-io/session-desktop/releases/download/v1.8.6/session-desktop-linux-amd64-1.8.6.deb"
     trap "rm /tmp/session-desktop.deb" EXIT
@@ -31,13 +25,6 @@ if ! command -v code; then
     echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/code.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list
     apt update -yq
     apt install -yq code
-fi
-
-if ! command -v rslsync; then
-    curl "https://download-cdn.resilio.com/2.7.3.1381/Debian/resilio-sync_2.7.3.1381-1_amd64.deb" -o /tmp/rslsync.deb
-    trap "rm /tmp/rslsync.deb" EXIT
-    apt install /tmp/rslsync.deb
-    sed -i 's/WantedBy=multi-user.target/WantedBy=default.target/g' /usr/lib/systemd/user/resilio-sync.service 
 fi
 
 if ! command -v tailscale; then
