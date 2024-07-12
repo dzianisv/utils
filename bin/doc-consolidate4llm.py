@@ -45,7 +45,8 @@ def consolidate_files(input_directory, output_file, git_url):
                     outfile.write(f"{github_file_url}\n")
                     outfile.write("<<<\n")
                     # Write the file content to the output file
-                    with open(os.path.join(root, file), 'r', encoding='utf-8') as infile:
+                    with open(os.path.join(root, file), 'rb') as infile:
+                        infile.read().decode(encoding='utf-8', errors='ignore')
                         outfile.write(infile.read())
                     outfile.write("\n>>>\n")
 
