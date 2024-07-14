@@ -3,6 +3,6 @@
 
 import os
 from langchain_openai import OpenAI
-llm = OpenAI(openai_api_base=os.environ.get("LLAMACPP_API_ENDPOINT", "http://localhost:8080/"), openai_api_key="hello.world")
+llm = OpenAI(openai_api_base=os.environ.get("API_BASE", "http://localhost:8080/"), openai_api_key="no", stop=["<|end|>"])
 response = llm("write a python hello world")
 print(response)
