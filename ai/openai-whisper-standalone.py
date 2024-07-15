@@ -28,6 +28,7 @@ def main():
     result = whisper.decode(model, mel, options)
 
     # print the recognized text
+    print(result)
     print(result.text)
 
 main()
