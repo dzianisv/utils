@@ -27,10 +27,10 @@ while True:
     random_x = random.randint(0, SCREEN_WIDTH)
     random_y = random.randint(0, SCREEN_HEIGHT)
     logger.info("moving cursor to %d %d", random_x, random_y)
-    pyautogui.moveTo(random_x, random_y, duration=1)
+    r = pyautogui.moveTo(random_x, random_y, duration=1)
+    print(r)
     logger.info("refreshing page")
     # Press the keys to refresh the page.
     pyautogui.hotkey('command', 'r')
 
-    # Wait 10 seconds before repeating.
     time.sleep(10)
