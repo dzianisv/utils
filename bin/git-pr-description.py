@@ -5,11 +5,11 @@ from langchain_core.prompts import PromptTemplate
 import logging
 import subprocess
 
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO)
 
 def main():
     llm = PoeLLM()
-    proc = subprocess.run(['git', 'diff', 'origin/master...HEAD'], check=True, encoding='utf8')
+    proc = subprocess.run(['git', 'diff', 'origin/master...HEAD'], stdout=subprocess.PIPE, check=True, encoding='utf8')
     diff = proc.stdout
 
     template = """
