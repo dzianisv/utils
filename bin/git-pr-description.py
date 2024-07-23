@@ -13,10 +13,19 @@ def main():
     diff = proc.stdout
 
     template = """
-Write a Github Pull Request description and title for the following git diff.
-Keep it short and technical.
+1. Write a Github Pull Request
+- description and
+- title
+for the following git diff.
 
+```diff
 {diff}
+```
+
+2. Write a JIRA ticket description.
+
+3. Keep it short and technical. Output in Markdown.
+
 """
 
     prompt = PromptTemplate(
