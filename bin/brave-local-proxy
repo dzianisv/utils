@@ -1,0 +1,4 @@
+#!/bin/bash
+set -eu
+exec brave-browser --proxy-server=http://127.0.0.1:8888 --user-data-dir=${USER_DATA_DIR:?USER_DATA_DIR is not set}
+
