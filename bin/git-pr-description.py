@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 
-from poept.langchain import PoeLLM
+from langchain_openai import OpenAI
 from langchain_core.prompts import PromptTemplate
 import logging
 import subprocess
+import os
 
 # logging.basicConfig(level=logging.INFO)
 
 def main():
-    llm = PoeLLM()
+    llm = OpenAI(model='gpt-4o', openai_api_base=os.environ.get("OPENAI_API_BASE"), openai_api_key=os.environ.get("OPENAI_API_KEY"))
     proc = subprocess.run(['git', 'diff', 'origin/master...HEAD'], stdout=subprocess.PIPE, check=True, encoding='utf8')
     diff = proc.stdout
 

@@ -6,19 +6,23 @@ fi
 
 
 DISK=${1:?usage $0 /dev/disk2 ~/Downloads/disk.iso}
-ISO=${2:-}
+DISK2=${2:-}
 
 for d in ${DISK}*; do
   diskutil unmount "$d"
 done
 
+
 args=""
-if [[ -n "$ISO" ]]; then
-  args="$args -boot d -cdrom $ISO"
+if [[  "$DISK2" =~ .iso ]]; then
+  args+="-boot d -cdrom \"$ISO\""
+elif [[ -n "$DISK2" ]]; then
+  diskutil unmount "$DISK2"
+  args+="-drive file=$DISK2,format=raw"
 fi
 
 exec qemu-system-x86_64 \
-  -m 8096 \
+  -m 2048 \
   -usb \
   -device usb-tablet \
   -monitor stdio \
