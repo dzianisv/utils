@@ -11,6 +11,12 @@ def transcribe(file):
         print(file, response["text"])
         return response["text"]
 
+def get_shortened_filename(filename):
+    if len(filename) <= 64:
+        return filename
+    else:
+        return filename[:61] + "..."
+
 if __name__ == "__main__":
     # Check if there are any files passed as arguments
     for file in sys.argv[1:]:
@@ -18,5 +24,5 @@ if __name__ == "__main__":
         transcription = transcribe(file)
 
         dirname = os.path.dirname(file)
-        new_path = os.path.join(dirname, transcription + extension)
+        new_path = os.path.join(dirname, get_shortened_filename(transcription) + extension)
         os.rename(file, new_path)
