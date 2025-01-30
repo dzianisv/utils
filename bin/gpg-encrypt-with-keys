@@ -1,0 +1,5 @@
+#!/bin/bash
+for f in "$@"; do
+    output_f="$f.asc"
+    gpg --encrypt --armor $(awk '{print "-r "$0}' keys.txt) --output "$output_f" "$f"
+done
