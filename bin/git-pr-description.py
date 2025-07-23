@@ -10,7 +10,12 @@ import os
 
 def main():
     llm = OpenAI(model='gpt-4o', openai_api_base=os.environ.get("OPENAI_API_BASE"), openai_api_key=os.environ.get("OPENAI_API_KEY"))
-    proc = subprocess.run(['git', 'diff', 'origin/master...HEAD'], stdout=subprocess.PIPE, check=True, encoding='utf8')
+    
+    # Check for the existence of 'master' or 'main' branch
+    branches = subprocess.run(['git', 'branch', '-r'], stdout=subprocess.PIPE, check=True, encoding='utf8').stdout
+    base_branch = 'origin/master' if 'origin/master' in branches else 'origin/main'
+    
+    proc = subprocess.run(['git', 'diff', f'{base_branch}...HEAD'], stdout=subprocess.PIPE, check=True, encoding='utf8')
     diff = proc.stdout
 
     template = """
@@ -35,7 +40,7 @@ for the following git diff.
     )
 
     chain = prompt | llm
-    response = chain.invoke({"diff":diff})
+    response = chain.invoke({"diff": diff})
     print(response)
 
 if __name__ == "__main__":
