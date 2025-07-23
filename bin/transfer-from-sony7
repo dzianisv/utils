@@ -1,0 +1,3 @@
+#!/bin/bash
+
+find /Volumes/SonyA7III -type f \( -iname '*.JPG' -o -iname '*.MP4' \) -exec mv {} /Volumes/Dzianis-2/AllPhotos/ \;

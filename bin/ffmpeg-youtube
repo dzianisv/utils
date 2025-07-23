@@ -1,0 +1,24 @@
+#!/bin/bash
+OUTPUT_DIR=$(pwd)
+
+# Loop through all provided input files
+for input_file in "$@"; do
+    # Check if the input file exists
+    if [[ ! -f "$input_file" ]]; then
+        echo "Error: File '$input_file' does not exist."
+        continue
+    fi
+
+    # Extract the base name of the file (without extension)
+    base_name=$(basename "$input_file" | sed 's/\.[^.]*$//')
+
+    # Output file path
+    output_file="$OUTPUT_DIR/${base_name}-h264.mp4"
+
+    ffmpeg -i "$input_file" \
+        -c:v libx264 -preset slow -crf 23 -b:v 8M -maxrate 8M -bufsize 16M -c:a aac -b:a 128k -movflags +faststart \
+        "$output_file"
+
+     # Copy modification time from the source video to the output file
+    touch -r "$input_file" "$output_file"
+done
