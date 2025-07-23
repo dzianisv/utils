@@ -1,0 +1,25 @@
+#!/bin/sh
+
+#qemu-img create -f qcow2  ubuntu-latest.img 40G
+
+boot_disk=${1:-ubuntu.qcow2}
+shift
+
+qemu-system-aarch64 \
+   -monitor stdio \
+   -M virt,highmem=off \
+   -accel hvf \
+   -cpu host \
+   -smp 4 \
+   -m 3000 \
+   -bios $(dirname $0)/QEMU_EFI.fd \
+   -device virtio-gpu-pci \
+   -display default,show-cursor=on \
+   -device qemu-xhci \
+   -device usb-kbd \
+   -device usb-tablet \
+   -device usb-tablet \
+   -device intel-hda \
+   -device hda-duplex \
+   -drive file=$boot_disk,format=qcow2,if=virtio,cache=writethrough \
+   "$@"
