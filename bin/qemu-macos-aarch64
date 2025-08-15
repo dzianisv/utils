@@ -5,6 +5,10 @@
 boot_disk=${1:-ubuntu.qcow2}
 shift
 
+echo "usage: $0 <boot_disk> <qemu_args>"
+echo -e "\t-drive file=/dev/disk5"
+echo -e "\n"
+
 qemu-system-aarch64 \
    -monitor stdio \
    -M virt,highmem=off \
@@ -21,5 +25,6 @@ qemu-system-aarch64 \
    -device usb-tablet \
    -device intel-hda \
    -device hda-duplex \
+   -nic user,model=virtio,hostfwd=tcp::2222-:22 \
    -drive file=$boot_disk,format=qcow2,if=virtio,cache=writethrough \
    "$@"

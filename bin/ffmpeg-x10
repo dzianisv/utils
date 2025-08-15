@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+  echo "Usage: $(basename "$0") <file1> [file2 …]" >&2
+  exit 1
+fi
+
+for f in "$@"; do
+  # skip non‑files
+  if [[ ! -f "$f" ]]; then
+    echo "Warning: '$f' not found, skipping." >&2
+    continue
+  fi
+
+  dir=$(dirname -- "$f")
+  base=$(basename -- "$f")
+  name="${base%.*}"
+  out="$dir/${name}.x10.mp4"
+
+  ffmpeg -i "$f" \
+    -vf "scale=1920:1080,setpts=PTS/10" \
+    -c:v libx264 -crf 25 -preset medium \
+    -an \
+    "$out"
+done
+
+
