@@ -20,6 +20,7 @@ for f in "$@"; do
 
   ffmpeg -i "$f" \
     -vf "scale=1920:1080,setpts=PTS/10" \
+    -r 60 \
     -c:v libx264 -crf 25 -preset medium \
     -an \
     "$out"
