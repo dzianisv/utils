@@ -1,0 +1,6 @@
+#!/bin/sh
+
+exec ffmpeg -i $1 \
+  -vf "fps=15,scale=800:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3" \
+  -loop 0 output.gif
+
