@@ -1,6 +1,7 @@
 #!/bin/sh
 
 exec ffmpeg -i $1 \
-  -vf "fps=15,scale=800:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3" \
-  -loop 0 output.gif
+  -t 8 \
+  -vf "fps=10,scale=600:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=48[p];[s1][p]paletteuse=dither=none" \
+ -loop 0 $(basename "$1" | sed 's/\.[^.]*$//').gif
 
