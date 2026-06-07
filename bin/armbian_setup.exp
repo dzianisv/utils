@@ -1,0 +1,75 @@
+#!/usr/bin/expect -f
+
+set timeout 30
+set host [lindex $argv 0]
+
+spawn ssh -o StrictHostKeyChecking=no root@$host
+
+expect {
+    "Password:" {
+        send "1234\r"
+        expect {
+            "You are required to change your password immediately" {
+                puts "\n=== ARMBIAN INITIAL SETUP DETECTED ==="
+                puts "Starting interactive setup process..."
+                
+                # Handle password change
+                expect "New password:"
+                puts "\nPlease enter a new root password:"
+                interact -o -nobuffer -re "New password:" return
+                
+                expect "Retype new password:"
+                puts "\nPlease confirm the new root password:"
+                interact -o -nobuffer -re "Retype new password:" return
+                
+                # Handle user creation
+                expect {
+                    "Please provide a username" {
+                        puts "\n=== USER CREATION ==="
+                        puts "Please enter a username for the new user:"
+                        interact -o -nobuffer -re "Please provide a username" return
+                        
+                        expect "Create password:"
+                        puts "\nPlease enter a password for the new user:"
+                        interact -o -nobuffer -re "Create password:" return
+                        
+                        expect "Repeat password:"
+                        puts "\nPlease confirm the password for the new user:"
+                        interact -o -nobuffer -re "Repeat password:" return
+                        
+                        expect "Please provide your real name:"
+                        puts "\nPlease enter the real name for the new user:"
+                        interact -o -nobuffer -re "Please provide your real name:" return
+                    }
+                    timeout {
+                        puts "\nSetup completed or no user creation required"
+                    }
+                }
+                
+                puts "\n=== SETUP COMPLETED ==="
+                puts "You should now be logged in as root with the new password"
+                interact
+            }
+            "root@" {
+                puts "\n=== ALREADY SETUP ==="
+                puts "This device appears to already be configured (no initial setup required)"
+                interact
+            }
+            timeout {
+                puts "\n=== CONNECTION FAILED ==="
+                puts "Could not connect or unexpected response"
+                exit 1
+            }
+        }
+    }
+    "Connection refused" {
+        puts "\n=== CONNECTION REFUSED ==="
+        puts "SSH connection refused - device may not be a Linux system with SSH enabled"
+        exit 1
+    }
+    timeout {
+        puts "\n=== TIMEOUT ==="
+        puts "Connection timeout - device may not be reachable or not the right device"
+        exit 1
+    }
+}

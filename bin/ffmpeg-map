@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+
+import argparse
+import subprocess
+import os
+
+def combine_media(video_path, audio_path, output_path):
+    """
+    Combines a video and audio file into a single MP4 file using ffmpeg.
+    """
+    try:
+        # Check if video and audio files exist
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file '{video_path}' does not exist.")
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file '{audio_path}' does not exist.")
+        
+        # Run ffmpeg command
+        command = [
+            "ffmpeg",
+            "-i", video_path,
+            "-i", audio_path,
+            "-c:v", "copy",  # Copy video stream without re-encoding
+            "-c:a", "aac",   # Encode audio to AAC format
+            "-map", "0:v:0", # Select the video stream from the first input
+            "-map", "1:a:0", # Select the audio stream from the second input
+            output_path
+        ]
+        print(f"Running command: {' '.join(command)}")
+        subprocess.run(command, check=True)
+        print(f"Output file created: {output_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error while combining media: {e}")
+    except FileNotFoundError as e:
+        print(e)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Combine video and audio into a single MP4 file.")
+    parser.add_argument("--video", required=True, help="Path to the video file (e.g., .webm).")
+    parser.add_argument("--audio", required=True, help="Path to the audio file (e.g., .mp3).")
+    parser.add_argument("--output", type=str)
+    args = parser.parse_args()
+
+    # Define output file name by replacing the video file's extension with .mp4
+    output_file = os.path.splitext(args.video)[0] + ".mp4" if args.output is None else args.output
+
+    # Combine the video and audio
+    combine_media(args.video, args.audio, output_file)

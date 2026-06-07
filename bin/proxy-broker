@@ -1,0 +1,169 @@
+#!/bin/bash
+#
+# proxy-broker — run a local rotating proxy server backed by proxybroker2.
+#
+# proxybroker2 finds public proxies, verifies them against "judge" sites, and
+# serves the working ones on a local port. Free public proxies (and the judge
+# sites) are flaky, so the recommended way to run this is as a KeepAlive
+# launchd service — see `install`.
+#
+# Usage:
+#   proxy-broker [serve]   Run the broker in the foreground (default).
+#   proxy-broker install   Copy self to ~/.local/bin and install a launchd
+#                          service that starts at login and restarts on crash.
+#   proxy-broker uninstall Remove the launchd service (keeps the binary).
+#   proxy-broker status    Show service state, listening port, and recent log.
+#
+set -euo pipefail
+
+# --- config ---------------------------------------------------------------
+HOST="127.0.0.1"
+PORT="3000"
+LABEL="com.dzianisvv.proxy-broker"
+PB_SRC="git+https://github.com/bluet/proxybroker2.git"
+
+BIN_DIR="$HOME/.local/bin"
+BIN_PATH="$BIN_DIR/proxy-broker"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_DIR="$HOME/Library/Logs"
+LOG_FILE="$LOG_DIR/proxy-broker.log"
+
+# launchd hands us a minimal PATH; make user-local + Homebrew bins reachable.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# --- helpers --------------------------------------------------------------
+
+# Absolute path to this script, regardless of how it was invoked.
+self_path() {
+  local src="${BASH_SOURCE[0]}"
+  cd "$(dirname "$src")" >/dev/null 2>&1 && printf '%s/%s\n' "$(pwd)" "$(basename "$src")"
+}
+
+# proxybroker2 relies on asyncio.get_event_loop() at import time, which was
+# removed in Python 3.14. Pick the newest interpreter it actually runs on.
+pick_python() {
+  local p
+  for p in python3.11 python3.12 python3.10 python3.13; do
+    if command -v "$p" >/dev/null 2>&1; then command -v "$p"; return 0; fi
+  done
+  return 1
+}
+
+ensure_proxybroker() {
+  if command -v proxybroker >/dev/null 2>&1; then return 0; fi
+
+  if ! command -v pipx >/dev/null 2>&1; then
+    echo "proxy-broker: pipx not found. Install it with: brew install pipx" >&2
+    exit 1
+  fi
+
+  local py
+  if ! py="$(pick_python)"; then
+    echo "proxy-broker: no compatible Python found (need 3.10-3.13)." >&2
+    exit 1
+  fi
+
+  echo "proxy-broker: installing proxybroker2 via pipx using $py ..." >&2
+  pipx install --python "$py" "$PB_SRC"
+}
+
+# --- commands -------------------------------------------------------------
+
+do_serve() {
+  ensure_proxybroker
+  exec proxybroker serve --host "$HOST" --port "$PORT" \
+    --types HTTP HTTPS --lvl High \
+    --countries DE FR NL SE PL ES IT --min-queue 5
+}
+
+do_install() {
+  ensure_proxybroker
+
+  # 1. Install the binary to ~/.local/bin.
+  mkdir -p "$BIN_DIR" "$LOG_DIR"
+  local src; src="$(self_path)"
+  if [ "$src" != "$BIN_PATH" ]; then
+    cp "$src" "$BIN_PATH"
+  fi
+  chmod +x "$BIN_PATH"
+  echo "proxy-broker: installed -> $BIN_PATH"
+
+  # 2. Write the launchd service.
+  mkdir -p "$(dirname "$PLIST")"
+  cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${BIN_PATH}</string>
+        <string>serve</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LOG_FILE}</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_FILE}</string>
+</dict>
+</plist>
+PLIST_EOF
+  echo "proxy-broker: wrote service -> $PLIST"
+
+  # 3. (Re)load it.
+  launchctl unload "$PLIST" 2>/dev/null || true
+  launchctl load -w "$PLIST"
+  echo "proxy-broker: service loaded. Serving on $HOST:$PORT (logs: $LOG_FILE)"
+}
+
+do_uninstall() {
+  launchctl unload "$PLIST" 2>/dev/null || true
+  rm -f "$PLIST"
+  echo "proxy-broker: service removed ($PLIST). Binary at $BIN_PATH left in place."
+}
+
+do_status() {
+  echo "Service ($LABEL):"
+  if launchctl list 2>/dev/null | grep -q "$LABEL"; then
+    launchctl list | awk 'NR==1 || /'"$LABEL"'/'
+  else
+    echo "  not loaded"
+  fi
+  echo
+  echo "Listening on $HOST:$PORT:"
+  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null
+  else
+    echo "  no listener"
+  fi
+  if [ -f "$LOG_FILE" ]; then
+    echo
+    echo "Recent log ($LOG_FILE):"
+    tail -n 8 "$LOG_FILE"
+  fi
+}
+
+# --- dispatch -------------------------------------------------------------
+case "${1:-serve}" in
+  serve|"")   do_serve ;;
+  install)    do_install ;;
+  uninstall)  do_uninstall ;;
+  status)     do_status ;;
+  -h|--help|help)
+    sed -n '2,/^set -euo/p' "$(self_path)" | sed 's/^# \{0,1\}//; /^set -euo/d'
+    ;;
+  *)
+    echo "proxy-broker: unknown command '$1' (try: serve, install, uninstall, status)" >&2
+    exit 1
+    ;;
+esac
