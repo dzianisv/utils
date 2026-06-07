@@ -19,6 +19,8 @@ set -euo pipefail
 # --- config ---------------------------------------------------------------
 HOST="127.0.0.1"
 PORT="3000"
+# Countries to draw exit proxies from (space-separated; empty = anywhere).
+COUNTRIES="DE FR NL SE PL ES IT"
 LABEL="com.dzianisvv.proxy-broker"
 PB_SRC="git+https://github.com/bluet/proxybroker2.git"
 
@@ -71,9 +73,61 @@ ensure_proxybroker() {
 
 do_serve() {
   ensure_proxybroker
-  exec proxybroker serve --host "$HOST" --port "$PORT" \
-    --types HTTP HTTPS --lvl High \
-    --countries DE FR NL SE PL ES IT --min-queue 5
+
+  # We deliberately DON'T use `proxybroker serve` here. That CLI path leaves
+  # the proxy pool's import_timeout at its 5s default, so the first client
+  # request that arrives before a proxy has been verified raises NoProxyError
+  # — which proxybroker turns into Server.stop(), tearing the whole server
+  # down. A browser pointed at the proxy hits this on every cold start, so the
+  # server can never warm its queue (a livelock): it dies, launchd restarts
+  # it, the browser hits it again, it dies again -> ERR_PROXY_CONNECTION_FAILED.
+  #
+  # Driving Broker.serve() through proxybroker's own public API lets us pass a
+  # long import_timeout, so a request instead WAITS for a proxy to appear
+  # (~15s on a cold start) and the server stays up and keeps rotating.
+  #
+  # Run it with the interpreter from proxybroker's own venv (read from the
+  # installed console script's shebang) so the import resolves regardless of
+  # which python is on PATH.
+  local venvpy
+  venvpy="$(awk 'NR==1{sub(/^#!/,"");print $1; exit}' "$(command -v proxybroker)")"
+
+  PB_HOST="$HOST" PB_PORT="$PORT" PB_COUNTRIES="$COUNTRIES" \
+  exec "$venvpy" - <<'PY'
+import asyncio
+import os
+
+from proxybroker import Broker
+
+HOST = os.environ.get("PB_HOST", "127.0.0.1")
+PORT = int(os.environ.get("PB_PORT", "3000"))
+COUNTRIES = os.environ.get("PB_COUNTRIES", "").split() or None
+TYPES = [("HTTP", "High"), ("HTTPS", "High")]
+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+proxies = asyncio.Queue()
+broker = Broker(proxies, loop=loop)
+
+# import_timeout high => an incoming request to an empty pool waits for a
+# proxy rather than raising NoProxyError (which proxybroker escalates to
+# Server.stop()). This is the whole reason we bypass the `serve` CLI.
+broker.serve(
+    host=HOST,
+    port=PORT,
+    types=TYPES,
+    countries=COUNTRIES,
+    limit=100,
+    min_queue=5,
+    import_timeout=1200,
+    max_import_retries=1000000,
+)
+print(f"Server started at http://{HOST}:{PORT}", flush=True)
+try:
+    loop.run_forever()
+except KeyboardInterrupt:
+    pass
+PY
 }
 
 do_install() {
