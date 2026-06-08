@@ -18,15 +18,21 @@
 #                             service that starts at login and restarts on crash.
 #   proxy-broker uninstall    Remove the launchd service (keeps the binary).
 #   proxy-broker status       Show service state, ports, and the live exit IP.
-#   proxy-broker country CC   Set the exit country (2-letter code, e.g. de, gb,
-#                             nl, jp) and restart the service.
+#   proxy-broker country WHERE  Set the exit location and restart. WHERE is:
+#                               non-us       any exit except the United States
+#                               de           one country (2-letter code)
+#                               de,fr,nl     a set of countries
 #
 set -euo pipefail
 
 # --- config ---------------------------------------------------------------
 SOCKS_PORT="9050"
 HTTP_PORT="3000"
-DEFAULT_COUNTRY="de"
+# Exit selection. Either:
+#   non-us         -> any exit in the world EXCEPT the United States (big pool)
+#   de             -> pin to one country (2-letter code)
+#   de,fr,nl       -> restrict to a set of countries
+DEFAULT_COUNTRY="non-us"
 LABEL="com.dzianisvv.proxy-broker"
 
 BIN_DIR="$HOME/.local/bin"
@@ -70,19 +76,35 @@ ensure_tor() {
   fi
 }
 
-# Generate torrc from the current config + chosen country.
+# Translate the exit selection into a Tor directive line.
+#   non-us / any  -> ExcludeExitNodes {us}   (anywhere but the US)
+#   "de"          -> ExitNodes {de}
+#   "de,fr,nl"    -> ExitNodes {de},{fr},{nl}
+tor_exit_directive() {
+  local sel; sel="$(exit_country)"
+  case "$sel" in
+    non-us|nonus|any|world)
+      echo "ExcludeExitNodes {us}"
+      ;;
+    *)
+      local list="" code
+      for code in ${sel//,/ }; do list="${list:+$list,}{$code}"; done
+      echo "ExitNodes $list"
+      ;;
+  esac
+}
+
+# Generate torrc from the current config + chosen exit selection.
 write_torrc() {
   mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"
   chmod 700 "$DATA_DIR"
-  local cc; cc="$(exit_country)"
   cat > "$TORRC" <<TORRC_EOF
 SocksPort 127.0.0.1:${SOCKS_PORT}
 HTTPTunnelPort 127.0.0.1:${HTTP_PORT}
 DataDirectory ${DATA_DIR}
-# Pin the exit to the chosen country. StrictNodes 1 = fail closed: if no exit
-# is available there, Tor refuses to build a circuit rather than leak a wrong
-# country. That's what we want for geo-unblocking.
-ExitNodes {${cc}}
+# Exit selection. StrictNodes 1 = fail closed: Tor obeys the restriction
+# strictly rather than ever falling back to a disallowed (e.g. US) exit.
+$(tor_exit_directive)
 StrictNodes 1
 Log notice stdout
 TORRC_EOF
@@ -167,11 +189,12 @@ restart_service() {
 
 do_country() {
   local cc="${1:-}"
-  if ! printf '%s' "$cc" | grep -qiE '^[a-z]{2}$'; then
-    echo "proxy-broker: country must be a 2-letter code (e.g. de, gb, nl, jp). Got: '$cc'" >&2
+  cc="$(printf '%s' "$cc" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
+  # Accept: non-us / any, a single 2-letter code, or a comma-separated list.
+  if ! printf '%s' "$cc" | grep -qiE '^(non-us|nonus|any|world|[a-z]{2}(,[a-z]{2})*)$'; then
+    echo "proxy-broker: expected 'non-us', a 2-letter code (de, gb, nl, jp), or a list (de,fr,nl). Got: '$cc'" >&2
     exit 1
   fi
-  cc="$(printf '%s' "$cc" | tr 'A-Z' 'a-z')"
   mkdir -p "$CONFIG_DIR"
   echo "$cc" > "$COUNTRY_FILE"
   write_torrc
