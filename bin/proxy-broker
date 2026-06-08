@@ -1,37 +1,46 @@
 #!/bin/bash
 #
-# proxy-broker — run a local rotating proxy server backed by proxybroker2.
+# proxy-broker — a local, geo-located proxy backed by Tor.
 #
-# proxybroker2 finds public proxies, verifies them against "judge" sites, and
-# serves the working ones on a local port. Free public proxies (and the judge
-# sites) are flaky, so the recommended way to run this is as a KeepAlive
-# launchd service — see `install`.
+# Exposes a stable proxy on localhost whose exit IP is in a country YOU choose,
+# so you can reach services that aren't available from your real location. Tor
+# is used as the engine because it is free, self-hosted, and — unlike scraped
+# "free public proxies" — actually reliable for HTTPS and lets you pin the exit
+# country.
+#
+# Two local endpoints are provided:
+#   socks5://127.0.0.1:9050   <- use this in your browser (handles HTTP+HTTPS)
+#   http://127.0.0.1:3000     <- HTTP-proxy interface (HTTPS/CONNECT only)
 #
 # Usage:
-#   proxy-broker [serve]   Run the broker in the foreground (default).
-#   proxy-broker install   Copy self to ~/.local/bin and install a launchd
-#                          service that starts at login and restarts on crash.
-#   proxy-broker uninstall Remove the launchd service (keeps the binary).
-#   proxy-broker status    Show service state, listening port, and recent log.
+#   proxy-broker [serve]      Run Tor in the foreground (default).
+#   proxy-broker install      Copy self to ~/.local/bin and install a launchd
+#                             service that starts at login and restarts on crash.
+#   proxy-broker uninstall    Remove the launchd service (keeps the binary).
+#   proxy-broker status       Show service state, ports, and the live exit IP.
+#   proxy-broker country CC   Set the exit country (2-letter code, e.g. de, gb,
+#                             nl, jp) and restart the service.
 #
 set -euo pipefail
 
 # --- config ---------------------------------------------------------------
-HOST="127.0.0.1"
-PORT="3000"
-# Countries to draw exit proxies from (space-separated; empty = anywhere).
-COUNTRIES="DE FR NL SE PL ES IT"
+SOCKS_PORT="9050"
+HTTP_PORT="3000"
+DEFAULT_COUNTRY="de"
 LABEL="com.dzianisvv.proxy-broker"
-PB_SRC="git+https://github.com/bluet/proxybroker2.git"
 
 BIN_DIR="$HOME/.local/bin"
 BIN_PATH="$BIN_DIR/proxy-broker"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+CONFIG_DIR="$HOME/.config/proxy-broker"
+COUNTRY_FILE="$CONFIG_DIR/exit-country"
+TORRC="$CONFIG_DIR/torrc"
+DATA_DIR="$HOME/.local/share/proxy-broker/tor"   # persistent => fast restarts
 LOG_DIR="$HOME/Library/Logs"
 LOG_FILE="$LOG_DIR/proxy-broker.log"
 
-# launchd hands us a minimal PATH; make user-local + Homebrew bins reachable.
-export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# launchd hands us a minimal PATH; make Homebrew's tor reachable.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin"
 
 # --- helpers --------------------------------------------------------------
 
@@ -41,97 +50,55 @@ self_path() {
   cd "$(dirname "$src")" >/dev/null 2>&1 && printf '%s/%s\n' "$(pwd)" "$(basename "$src")"
 }
 
-# proxybroker2 relies on asyncio.get_event_loop() at import time, which was
-# removed in Python 3.14. Pick the newest interpreter it actually runs on.
-pick_python() {
-  local p
-  for p in python3.11 python3.12 python3.10 python3.13; do
-    if command -v "$p" >/dev/null 2>&1; then command -v "$p"; return 0; fi
-  done
-  return 1
+# The chosen exit country (sidecar file wins over the built-in default).
+exit_country() {
+  if [ -f "$COUNTRY_FILE" ]; then
+    tr -d '[:space:]' < "$COUNTRY_FILE" | tr 'A-Z' 'a-z'
+  else
+    echo "$DEFAULT_COUNTRY"
+  fi
 }
 
-ensure_proxybroker() {
-  if command -v proxybroker >/dev/null 2>&1; then return 0; fi
-
-  if ! command -v pipx >/dev/null 2>&1; then
-    echo "proxy-broker: pipx not found. Install it with: brew install pipx" >&2
+ensure_tor() {
+  if command -v tor >/dev/null 2>&1; then return 0; fi
+  if command -v brew >/dev/null 2>&1; then
+    echo "proxy-broker: installing tor via Homebrew ..." >&2
+    brew install tor
+  else
+    echo "proxy-broker: tor not found and Homebrew unavailable. Install tor first." >&2
     exit 1
   fi
+}
 
-  local py
-  if ! py="$(pick_python)"; then
-    echo "proxy-broker: no compatible Python found (need 3.10-3.13)." >&2
-    exit 1
-  fi
-
-  echo "proxy-broker: installing proxybroker2 via pipx using $py ..." >&2
-  pipx install --python "$py" "$PB_SRC"
+# Generate torrc from the current config + chosen country.
+write_torrc() {
+  mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"
+  chmod 700 "$DATA_DIR"
+  local cc; cc="$(exit_country)"
+  cat > "$TORRC" <<TORRC_EOF
+SocksPort 127.0.0.1:${SOCKS_PORT}
+HTTPTunnelPort 127.0.0.1:${HTTP_PORT}
+DataDirectory ${DATA_DIR}
+# Pin the exit to the chosen country. StrictNodes 1 = fail closed: if no exit
+# is available there, Tor refuses to build a circuit rather than leak a wrong
+# country. That's what we want for geo-unblocking.
+ExitNodes {${cc}}
+StrictNodes 1
+Log notice stdout
+TORRC_EOF
 }
 
 # --- commands -------------------------------------------------------------
 
 do_serve() {
-  ensure_proxybroker
-
-  # We deliberately DON'T use `proxybroker serve` here. That CLI path leaves
-  # the proxy pool's import_timeout at its 5s default, so the first client
-  # request that arrives before a proxy has been verified raises NoProxyError
-  # — which proxybroker turns into Server.stop(), tearing the whole server
-  # down. A browser pointed at the proxy hits this on every cold start, so the
-  # server can never warm its queue (a livelock): it dies, launchd restarts
-  # it, the browser hits it again, it dies again -> ERR_PROXY_CONNECTION_FAILED.
-  #
-  # Driving Broker.serve() through proxybroker's own public API lets us pass a
-  # long import_timeout, so a request instead WAITS for a proxy to appear
-  # (~15s on a cold start) and the server stays up and keeps rotating.
-  #
-  # Run it with the interpreter from proxybroker's own venv (read from the
-  # installed console script's shebang) so the import resolves regardless of
-  # which python is on PATH.
-  local venvpy
-  venvpy="$(awk 'NR==1{sub(/^#!/,"");print $1; exit}' "$(command -v proxybroker)")"
-
-  PB_HOST="$HOST" PB_PORT="$PORT" PB_COUNTRIES="$COUNTRIES" \
-  exec "$venvpy" - <<'PY'
-import asyncio
-import os
-
-from proxybroker import Broker
-
-HOST = os.environ.get("PB_HOST", "127.0.0.1")
-PORT = int(os.environ.get("PB_PORT", "3000"))
-COUNTRIES = os.environ.get("PB_COUNTRIES", "").split() or None
-TYPES = [("HTTP", "High"), ("HTTPS", "High")]
-
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-proxies = asyncio.Queue()
-broker = Broker(proxies, loop=loop)
-
-# import_timeout high => an incoming request to an empty pool waits for a
-# proxy rather than raising NoProxyError (which proxybroker escalates to
-# Server.stop()). This is the whole reason we bypass the `serve` CLI.
-broker.serve(
-    host=HOST,
-    port=PORT,
-    types=TYPES,
-    countries=COUNTRIES,
-    limit=100,
-    min_queue=5,
-    import_timeout=1200,
-    max_import_retries=1000000,
-)
-print(f"Server started at http://{HOST}:{PORT}", flush=True)
-try:
-    loop.run_forever()
-except KeyboardInterrupt:
-    pass
-PY
+  ensure_tor
+  write_torrc
+  echo "proxy-broker: exit country = $(exit_country); socks5://127.0.0.1:${SOCKS_PORT}, http://127.0.0.1:${HTTP_PORT}" >&2
+  exec tor -f "$TORRC"
 }
 
 do_install() {
-  ensure_proxybroker
+  ensure_tor
 
   # 1. Install the binary to ~/.local/bin.
   mkdir -p "$BIN_DIR" "$LOG_DIR"
@@ -159,7 +126,7 @@ do_install() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.local/bin</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -177,13 +144,43 @@ PLIST_EOF
   # 3. (Re)load it.
   launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load -w "$PLIST"
-  echo "proxy-broker: service loaded. Serving on $HOST:$PORT (logs: $LOG_FILE)"
+  echo "proxy-broker: service loaded (exit: $(exit_country))."
+  echo "proxy-broker: point your browser at socks5://127.0.0.1:${SOCKS_PORT}"
+  echo "proxy-broker: logs -> $LOG_FILE"
 }
 
 do_uninstall() {
   launchctl unload "$PLIST" 2>/dev/null || true
   rm -f "$PLIST"
   echo "proxy-broker: service removed ($PLIST). Binary at $BIN_PATH left in place."
+}
+
+# Restart the launchd service if it's loaded (used after a config change).
+restart_service() {
+  if launchctl list 2>/dev/null | grep -q "$LABEL"; then
+    launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null \
+      || { launchctl unload "$PLIST" 2>/dev/null; launchctl load -w "$PLIST"; }
+    return 0
+  fi
+  return 1
+}
+
+do_country() {
+  local cc="${1:-}"
+  if ! printf '%s' "$cc" | grep -qiE '^[a-z]{2}$'; then
+    echo "proxy-broker: country must be a 2-letter code (e.g. de, gb, nl, jp). Got: '$cc'" >&2
+    exit 1
+  fi
+  cc="$(printf '%s' "$cc" | tr 'A-Z' 'a-z')"
+  mkdir -p "$CONFIG_DIR"
+  echo "$cc" > "$COUNTRY_FILE"
+  write_torrc
+  echo "proxy-broker: exit country set to '$cc'."
+  if restart_service; then
+    echo "proxy-broker: service restarted; new circuits will exit via '$cc' (give it ~15s)."
+  else
+    echo "proxy-broker: service not loaded — run 'proxy-broker install' or 'serve'."
+  fi
 }
 
 do_status() {
@@ -194,16 +191,28 @@ do_status() {
     echo "  not loaded"
   fi
   echo
-  echo "Listening on $HOST:$PORT:"
-  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
-    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null
+  echo "Configured exit country: $(exit_country)"
+  echo
+  for p in "$SOCKS_PORT" "$HTTP_PORT"; do
+    if lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+      echo "Listening on 127.0.0.1:$p  (up)"
+    else
+      echo "Listening on 127.0.0.1:$p  (down)"
+    fi
+  done
+  echo
+  echo "Live exit IP (via socks5://127.0.0.1:$SOCKS_PORT):"
+  local info
+  info="$(curl -s --max-time 20 --socks5-hostname "127.0.0.1:$SOCKS_PORT" https://ipinfo.io/json 2>/dev/null)" || true
+  if [ -n "$info" ]; then
+    printf '%s\n' "$info" | grep -iE '"ip"|"city"|"country"|"org"' | sed 's/^/  /'
   else
-    echo "  no listener"
+    echo "  (no response yet — Tor may still be bootstrapping)"
   fi
   if [ -f "$LOG_FILE" ]; then
     echo
     echo "Recent log ($LOG_FILE):"
-    tail -n 8 "$LOG_FILE"
+    tail -n 6 "$LOG_FILE"
   fi
 }
 
@@ -213,11 +222,12 @@ case "${1:-serve}" in
   install)    do_install ;;
   uninstall)  do_uninstall ;;
   status)     do_status ;;
+  country)    shift; do_country "${1:-}" ;;
   -h|--help|help)
     sed -n '2,/^set -euo/p' "$(self_path)" | sed 's/^# \{0,1\}//; /^set -euo/d'
     ;;
   *)
-    echo "proxy-broker: unknown command '$1' (try: serve, install, uninstall, status)" >&2
+    echo "proxy-broker: unknown command '$1' (try: serve, install, uninstall, status, country)" >&2
     exit 1
     ;;
 esac
