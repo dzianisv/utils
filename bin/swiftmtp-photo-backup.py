@@ -1014,8 +1014,11 @@ def do_dry_run(cli: CLI, dest: str, mount: str, device_id: str, model: str,
         for root, msg in warnings:
             print(f"  ! source {root} skipped: {msg}")
     for f in pending[:20]:
-        final = build_final_path(dest, device_dir, storage, f.remote_path)
-        print(f"  + {f.remote_path} -> {os.path.relpath(final, dest)} ({human_bytes(f.size)})")
+        try:
+            final = build_final_path(dest, device_dir, storage, f.remote_path)
+            print(f"  + {f.remote_path} -> {os.path.relpath(final, dest)} ({human_bytes(f.size)})")
+        except ValueError as exc:
+            print(f"  ! {f.remote_path} -> UNSAFE destination, would be skipped ({exc})")
     if len(pending) > 20:
         print(f"  … and {len(pending) - 20} more")
     if pending_bytes > usable:
@@ -1061,9 +1064,9 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
                 failed += 1
                 log.error("device connection lost; aborting remaining transfers")
                 break
-            except (OSError, RuntimeError) as exc:
-                # Local filesystem / collision / hashing error for THIS file: record
-                # and keep going rather than aborting the whole run with a traceback.
+            except (OSError, RuntimeError, ValueError) as exc:
+                # Local filesystem / collision / hashing / path-containment error for
+                # THIS file: record and keep going rather than aborting with a traceback.
                 manifest.mark_status(fp, storage, f, "failed",
                                      f"local error: {type(exc).__name__}: {exc}", run_id)
                 failed += 1
@@ -1102,13 +1105,16 @@ def transfer_one(cli: CLI, manifest: Manifest, dest: str, device_id: str, device
     """
     identity = f"{fp}|{storage}|{f.remote_path}|{f.size}|{f.modified}"
     id_hash = hashlib.sha256(identity.encode()).hexdigest()[:8]
-    final_default = build_final_path(dest, device_dir, storage, f.remote_path)
 
     incoming_sub = os.path.join(incoming_dir, uuid.uuid4().hex)
     os.makedirs(incoming_sub, exist_ok=True)
     timeout = pull_timeout if pull_timeout > 0 else max(600, int(f.size / (150 * 1024)) + 600)
     partial: str | None = None
     try:
+        # Computed inside the guarded block: build_final_path raises ValueError if
+        # the sanitized/realpath'd destination would escape DEST (e.g. via a symlink
+        # ancestor). That must fail just this file, not abort the whole run.
+        final_default = build_final_path(dest, device_dir, storage, f.remote_path)
         rc, out, _err = cli.run("pull", [device_id, storage, f.remote_path, incoming_sub], timeout)
         if rc != 0 or not pull_reported_success(out):
             manifest.mark_status(fp, storage, f, "failed",
@@ -1173,9 +1179,9 @@ def transfer_one(cli: CLI, manifest: Manifest, dest: str, device_id: str, device
         return "transferred"
     except DeviceError:
         raise
-    except (OSError, RuntimeError) as exc:
-        # Any local filesystem / collision / hashing error: never crash the run;
-        # preserve the pulled bytes for audit when we still have them.
+    except (OSError, RuntimeError, ValueError) as exc:
+        # Any local filesystem / collision / hashing / path-containment error:
+        # never crash the run; preserve the pulled bytes for audit when we have them.
         if partial is not None and os.path.exists(partial):
             _quarantine(partial, quarantine_dir, f, id_hash)
             partial = None
