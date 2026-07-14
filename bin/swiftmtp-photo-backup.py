@@ -75,6 +75,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import shutil
 import subprocess
@@ -159,6 +160,24 @@ class LsParseError(InventoryError):
     Raised (fail-closed) rather than silently dropping or mis-attributing a row,
     e.g. a file name containing a newline, undecodable bytes, or non-BMP text in
     a fixed-width column. Treated as an inventory failure (non-zero exit).
+    """
+
+
+class AdbError(Exception):
+    """An adb operation failed, timed out, or returned ambiguous output.
+
+    Fail-closed marker for the device-side deletion path: any AdbError must be
+    treated as "cannot safely proceed", never as success. Probes that merely find
+    an unexpected/ambiguous result return None instead of raising; AdbError is
+    reserved for transport-level failures (timeout, adb not runnable, unresolvable
+    device) that abort the operation.
+    """
+
+
+class DeletionError(Exception):
+    """A source-deletion precondition failed (e.g. an unmappable remote path).
+
+    Raised to refuse deletion of a single file; the phone file is always kept.
     """
 
 
@@ -404,6 +423,283 @@ def resolve_storage(cli: CLI, device_id: str, requested: str | None) -> tuple[st
         return storages[0][0], storage_used_bytes(storages[0][1])
     listing = "\n".join(f"  {sid}  {name}" for sid, name in storages)
     raise DeviceError("Multiple storages found; select one with --storage <id>:\n" + listing)
+
+
+# --- ADB (device-side verification + single-file deletion) -------------------
+# SAFETY CONTRACT for this whole section:
+#   * The Adb class performs ONLY read-only probes (stat, sha256sum, symlink and
+#     existence tests, getprop) PLUS exactly one mutating operation:
+#     `delete_regular_file`, which runs `rm -- <one shlex.quoted absolute path>`
+#     and nothing else. There is deliberately NO recursive delete, NO directory
+#     removal, NO wildcard, and NO generic command path. Removing a single,
+#     independently re-verified regular file is the ONLY device mutation this
+#     entire tool can perform.
+#   * Every device command is handed as ONE pre-quoted argv element to
+#     `adb -s <serial> shell <cmd>` with NO intervening host shell, so any shell
+#     metacharacters in a path are treated literally (injection-safe: verified on
+#     hardware against spaces, quotes, ;, $(), backticks, |, &, *, ?, tabs,
+#     unicode, and leading-dash names).
+#   * Any probe that is ambiguous or fails returns None (transport failures raise
+#     AdbError); callers ALWAYS fail closed (keep the phone file) on None/raise.
+DEFAULT_ADB = "/opt/homebrew/bin/adb"
+
+
+class Adb:
+    """Injection-safe adb wrapper: read-only probes plus single-file ``rm --``.
+
+    ``delete_regular_file`` is the only mutating method; all others are read-only.
+    Probes return None on any ambiguity so callers fail closed.
+    """
+
+    def __init__(self, adb_path: str, serial: str, timeout: int):
+        self.adb_path = adb_path
+        self.serial = serial
+        self.timeout = timeout
+
+    def _shell(self, cmd_str: str) -> tuple[int, str, str]:
+        # Defense in depth: callers already reject these in path validation, but a
+        # NUL/newline/CR here could split or truncate the single shell command line
+        # we hand to adb, so refuse them unconditionally.
+        if any(c in cmd_str for c in ("\x00", "\n", "\r")):
+            raise AdbError("refusing adb shell command containing NUL/newline/CR")
+        cmd = [self.adb_path, "-s", self.serial, "shell", cmd_str]
+        log.debug("exec adb: %s", _redact(f"adb -s {self.serial} shell {cmd_str}"))
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise AdbError(f"adb shell timed out after {self.timeout}s")
+        except OSError as exc:
+            raise AdbError(f"could not run adb ({self.adb_path}): {exc}")
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+    def stat_type_size(self, path: str) -> tuple[str, int] | None:
+        """Return (file_type, size_bytes) via ``stat -c '%F|%s'``, or None.
+
+        None means the file is absent or the output did not match exactly; the
+        caller must then disambiguate with ``exists`` and never assume a size.
+        """
+        rc, out, _err = self._shell("stat -c '%F|%s' -- " + shlex.quote(path))
+        if rc != 0:
+            return None
+        parts = out.strip().rsplit("|", 1)
+        if len(parts) != 2:
+            return None
+        type_str, size_str = parts
+        if not type_str or not size_str.isdigit():
+            return None
+        return type_str, int(size_str)
+
+    def is_symlink(self, path: str) -> bool | None:
+        """True if the path is a symlink, False if not, None if ambiguous.
+
+        Uses a stdout sentinel (not exit code) because the test-and-printf always
+        exits 0. A None result must be treated as "do not delete".
+        """
+        rc, out, _err = self._shell(
+            "[ -L " + shlex.quote(path) + " ] && printf SYMLINK || printf NOTLINK"
+        )
+        s = out.strip()
+        if s == "SYMLINK":
+            return True
+        if s == "NOTLINK":
+            return False
+        return None
+
+    def sha256(self, path: str) -> str | None:
+        """Return the lowercase 64-hex SHA-256 of the on-device file, or None."""
+        rc, out, _err = self._shell("sha256sum -- " + shlex.quote(path))
+        if rc != 0:
+            return None
+        m = re.match(r"^([0-9a-f]{64})(?:\s|$)", out.strip())
+        return m.group(1) if m else None
+
+    def exists(self, path: str) -> bool | None:
+        """True if the path exists, False if not, None if ambiguous (sentinel)."""
+        rc, out, _err = self._shell(
+            "[ -e " + shlex.quote(path) + " ] && printf PRESENT || printf ABSENT"
+        )
+        s = out.strip()
+        if s == "PRESENT":
+            return True
+        if s == "ABSENT":
+            return False
+        return None
+
+    def delete_regular_file(self, path: str) -> tuple[int, str, str]:
+        """Run exactly ``rm -- <one quoted path>`` — the ONLY mutating command.
+
+        Asserts the constructed command is precisely a single-file ``rm --`` (three
+        tokens: ``rm``, ``--``, the path) so this method can never be repurposed
+        into a recursive/wildcard/multi-target deletion.
+        """
+        cmd_str = "rm -- " + shlex.quote(path)
+        # Load-bearing guard (NOT asserts — those are stripped under `python -O`):
+        # prove the command is exactly the three tokens `rm`, `--`, <path> so this
+        # method can never be repurposed into a recursive/wildcard/multi-target rm.
+        if not cmd_str.startswith("rm -- ") or shlex.split(cmd_str) != ["rm", "--", path]:
+            raise AdbError("refusing malformed delete command (not a single-file `rm -- <path>`)")
+        return self._shell(cmd_str)
+
+    def getprop_serialno(self) -> str | None:
+        """Return the device's live ``ro.serialno`` (used for the identity gate)."""
+        rc, out, _err = self._shell("getprop ro.serialno")
+        if rc != 0:
+            return None
+        return out.strip() or None
+
+
+def resolve_adb_device(adb_path: str, requested_serial: str | None) -> str:
+    """Return the single authorized adb serial to operate on (fail closed).
+
+    Parses ``adb devices`` (``SERIAL\\tSTATE``). Only STATE=="device" (authorized)
+    is usable; "unauthorized"/"offline" serials are surfaced in errors but never
+    selected. A requested serial must match exactly one authorized device; with no
+    request we require exactly one authorized device and otherwise demand
+    ``--adb-serial``. Full serials are secrets — only fingerprints are ever logged.
+    """
+    try:
+        proc = subprocess.run(
+            [adb_path, "devices"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise AdbError("`adb devices` timed out")
+    except OSError as exc:
+        raise AdbError(f"could not run adb ({adb_path}): {exc}")
+    if proc.returncode != 0:
+        raise AdbError(f"`adb devices` failed (rc={proc.returncode}): {proc.stderr.strip()}")
+
+    authorized: list[str] = []
+    unusable: list[str] = []
+    for line in proc.stdout.splitlines():
+        line = line.rstrip("\r")
+        if not line or line.startswith("List of devices"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        serial, state = parts[0].strip(), parts[1].strip()
+        if not serial:
+            continue
+        if state == "device":
+            authorized.append(serial)
+        elif state in ("unauthorized", "offline"):
+            unusable.append(f"{device_fingerprint(serial)}:{state}")
+    hint = f" (unauthorized/offline: {', '.join(unusable)})" if unusable else ""
+
+    if requested_serial:
+        if requested_serial in authorized:
+            return requested_serial
+        raise AdbError("--adb-serial did not match an authorized adb device" + hint)
+    if len(authorized) == 1:
+        return authorized[0]
+    if not authorized:
+        raise AdbError(
+            "no authorized adb device (connect + unlock the phone and accept the USB "
+            "debugging prompt)" + hint
+        )
+    raise AdbError(
+        f"multiple authorized adb devices ({len(authorized)}); select one with "
+        "--adb-serial <serial>"
+    )
+
+
+def map_remote_to_android(remote_path: str, android_root: str) -> str:
+    """Map an MTP remote path to its on-device Android filesystem path (fail closed).
+
+    The MTP storage root corresponds to ``android_root`` (default /sdcard). We
+    refuse anything that could escape that root or that the adb transport cannot
+    represent unambiguously: non-absolute inputs, ``.``/``..`` components, empty
+    paths, and NUL/newline/CR/control chars. Containment is enforced both
+    structurally (must start with ``root + "/"``) and via ``os.path.normpath``.
+    """
+    if not isinstance(remote_path, str) or not remote_path.startswith("/"):
+        raise DeletionError(f"remote path is not an absolute string: {remote_path!r}")
+    for ch in remote_path:
+        o = ord(ch)
+        if ch == "\x00" or o < 0x20 or o == 0x7F:
+            raise DeletionError("remote path contains a NUL/newline/control character")
+    remote_components = [c for c in remote_path.split("/") if c != ""]
+    if not remote_components:
+        raise DeletionError("remote path has no components (cannot map a bare '/')")
+    for c in remote_components:
+        if c in (".", ".."):
+            raise DeletionError(f"remote path contains a '.'/'..' component: {remote_path!r}")
+
+    if not isinstance(android_root, str) or not android_root.startswith("/"):
+        raise DeletionError(f"android root is not an absolute path: {android_root!r}")
+    for ch in android_root:
+        o = ord(ch)
+        if ch == "\x00" or o < 0x20 or o == 0x7F:
+            raise DeletionError("android root contains a NUL/newline/control character")
+    root = android_root.rstrip("/")
+    if not root:
+        raise DeletionError("android root must not be the filesystem root '/'")
+    for c in [c for c in root.split("/") if c != ""]:
+        if c in (".", ".."):
+            raise DeletionError(f"android root contains a '.'/'..' component: {android_root!r}")
+
+    android_path = root + "/" + "/".join(remote_components)
+    if not android_path.startswith(root + "/"):
+        raise DeletionError("mapped path is not contained under the android root")
+    if os.path.normpath(android_path) != android_path:
+        raise DeletionError(f"mapped path is not normalized (traversal risk): {android_path!r}")
+    return android_path
+
+
+def _prepare_adb_for_delete(adb_path: str, requested_serial: str | None,
+                            device_id: str, adb_timeout: int) -> "Adb":
+    """Validate adb, resolve the target serial, and PROVE it is the same physical
+    device we backed up before enabling deletion. Fails closed (raises) on any
+    mismatch so we can never delete from a different phone than the one we imaged.
+
+    Same-physical-device gate (all three must agree):
+      1. the MTP device id has a serial component,
+      2. the resolved adb serial equals one of those components, and
+      3. the device's live ``getprop ro.serialno`` equals that adb serial.
+    Full serials are treated as secrets; only fingerprints appear in errors/logs.
+    """
+    if not os.path.isfile(adb_path) or not os.access(adb_path, os.X_OK):
+        raise PreflightError(
+            f"adb not found or not executable at {adb_path}. Install platform-tools "
+            "or pass --adb PATH."
+        )
+    adb_serial = resolve_adb_device(adb_path, requested_serial)
+    register_secret(adb_serial)
+
+    serial_parts = device_id.split("|")[2:]
+    if not serial_parts:
+        raise DeviceError(
+            "cannot verify device identity for deletion: the MTP device id has no "
+            "serial component; refusing --delete-after-verify"
+        )
+    if adb_serial not in serial_parts:
+        raise DeviceError(
+            "adb device does not match the MTP device (serial mismatch); refusing to "
+            f"delete. adb fp={device_fingerprint(adb_serial)}"
+        )
+    adb = Adb(adb_path, adb_serial, adb_timeout)
+    live = adb.getprop_serialno()
+    if live is not None:
+        register_secret(live)
+    if live != adb_serial:
+        raise DeviceError(
+            "adb device did not confirm its serial (getprop ro.serialno mismatch or no "
+            f"response); refusing to delete. adb fp={device_fingerprint(adb_serial)}"
+        )
+    log.info("delete-after-verify armed: adb device confirmed (fp=%s)",
+             device_fingerprint(adb_serial))
+    return adb
 
 
 # --- ls output parsing (strict, grounded in upstream source) -----------------
@@ -789,6 +1085,7 @@ class Manifest:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+        self._migrate()
 
     def _init_schema(self) -> None:
         with self.conn:
@@ -836,6 +1133,43 @@ class Manifest:
                 );
                 CREATE INDEX IF NOT EXISTS idx_imports_identity
                     ON imports(device_fingerprint, storage_id, status);
+                """
+            )
+
+    def _migrate(self) -> None:
+        """Idempotently add deletion-tracking columns/table to an existing manifest.
+
+        Safe to run repeatedly and against the pre-existing production DB (which
+        already holds completed + failed rows): each ALTER is guarded by a
+        PRAGMA table_info presence check, and the events table uses
+        CREATE TABLE IF NOT EXISTS. No existing row/column is ever rewritten.
+        """
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(imports)")}
+        additions = [
+            ("deletion_status", "ALTER TABLE imports ADD COLUMN deletion_status TEXT"),
+            ("deletion_error", "ALTER TABLE imports ADD COLUMN deletion_error TEXT"),
+            ("source_deleted_at", "ALTER TABLE imports ADD COLUMN source_deleted_at TEXT"),
+            ("delete_attempts",
+             "ALTER TABLE imports ADD COLUMN delete_attempts INTEGER NOT NULL DEFAULT 0"),
+        ]
+        with self.conn:
+            for col, ddl in additions:
+                if col not in existing:
+                    self.conn.execute(ddl)
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS deletion_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    import_id INTEGER,
+                    device_fingerprint TEXT,
+                    storage_id TEXT,
+                    remote_path TEXT,
+                    action TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    detail TEXT,
+                    run_id TEXT,
+                    created_at TEXT NOT NULL
+                )
                 """
             )
 
@@ -938,6 +1272,48 @@ class Manifest:
             ).fetchall()
         return self.conn.execute("SELECT * FROM imports WHERE status='completed'").fetchall()
 
+    # -- source deletion bookkeeping --
+    def rows_pending_deletion(self, fp: str, storage: str):
+        """Completed rows for this device/storage still eligible for source deletion.
+
+        A row is eligible when it has never been processed (deletion_status IS NULL)
+        or a prior attempt is retryable ('pending_delete' or 'delete_failed'). Rows
+        already 'deleted' or 'source_absent' are excluded so they are never retried.
+        """
+        return self.conn.execute(
+            "SELECT * FROM imports WHERE status='completed' AND device_fingerprint=? "
+            "AND storage_id=? AND (deletion_status IS NULL OR deletion_status IN "
+            "('pending_delete','delete_failed'))",
+            (fp, storage),
+        ).fetchall()
+
+    def mark_deletion(self, import_id: int, status: str, error: str | None,
+                      deleted_at: str | None = None) -> None:
+        """Record the outcome of a deletion attempt for one import row.
+
+        ``source_deleted_at`` is only set the first time it is supplied (COALESCE)
+        so a later retry cannot clobber the original deletion timestamp;
+        ``delete_attempts`` increments on every call.
+        """
+        with self.conn:
+            self.conn.execute(
+                "UPDATE imports SET deletion_status=?, deletion_error=?, "
+                "source_deleted_at=COALESCE(?, source_deleted_at), "
+                "delete_attempts=delete_attempts+1, updated_at=? WHERE id=?",
+                (status, error, deleted_at, now_iso(), import_id),
+            )
+
+    def record_deletion_event(self, import_id: int | None, fp: str, storage: str,
+                              remote_path: str, action: str, result: str,
+                              detail: str | None, run_id: str | None) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO deletion_events(import_id, device_fingerprint, storage_id, "
+                "remote_path, action, result, detail, run_id, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (import_id, fp, storage, remote_path, action, result, detail, run_id, now_iso()),
+            )
+
 
 # --- Reconcile ---------------------------------------------------------------
 
@@ -960,6 +1336,113 @@ def reconcile(manifest: Manifest, dest: str, fp: str, storage: str) -> int:
     if requeued:
         log.warning("reconcile requeued %d import(s) with missing/mismatched local files", requeued)
     return requeued
+
+
+# --- Source deletion (device-side, single-file, fail closed) -----------------
+
+def delete_source_for_row(adb: "Adb", manifest: Manifest, dest: str, row,
+                          android_root: str, run_id: str) -> str:
+    """Delete ONE phone file only after re-proving the local backup is intact and
+    the on-device file is byte-identical. Returns one of ``'deleted'``,
+    ``'failed'``, ``'absent'``, or ``'skip'``.
+
+    Every check must affirmatively pass. On ANY ambiguity or mismatch we fail
+    closed: the row is marked ``delete_failed`` (retried next run) and the phone
+    file is KEPT. The single ``rm --`` is only reached after the local copy is
+    re-verified (size + SHA-256) AND the phone file is confirmed a non-symlink
+    regular file whose size and SHA-256 match the manifest.
+
+    Known limitation (inherent to adb, not a defect): the sequence "verify size +
+    SHA-256" then "rm <path>" is not atomic — MTP/adb offer no device-side
+    compare-and-delete. If the file at that exact path were replaced in the
+    sub-second window between the SHA-256 probe and the ``rm``, ``rm`` would remove
+    whatever now occupies the path. We accept this narrow window: deletion is only
+    ever armed for a device we just imaged and each file is re-hashed immediately
+    before removal, so it is far tighter than a size/mtime-only check.
+    """
+    remote_path = row["remote_path"]
+    size = row["size"]
+    sha = row["sha256"]
+    relpath = row["local_relpath"]
+    fp = row["device_fingerprint"]
+    storage = row["storage_id"]
+    import_id = row["id"]
+
+    def fail(detail: str, action: str = "verify") -> str:
+        manifest.mark_deletion(import_id, "delete_failed", detail)
+        manifest.record_deletion_event(import_id, fp, storage, remote_path, action,
+                                       "failed", detail, run_id)
+        log.warning("keep (not deleting) %s: %s", os.path.basename(remote_path), detail)
+        return "failed"
+
+    # 1. We can only re-verify against durable local metadata.
+    if sha is None or relpath is None:
+        return fail("missing local metadata (sha/relpath)")
+
+    # 2. Local re-verification (defense in depth; reconcile already requeued any
+    #    missing/wrong-size local copy, so a still-'completed' row should pass).
+    local = os.path.join(dest, relpath)
+    if not os.path.isfile(local):
+        return fail("local file missing")
+    try:
+        if os.path.getsize(local) != size:
+            return fail("local size mismatch")
+        if sha256_file(local) != sha:
+            return fail("local sha mismatch")
+    except OSError as exc:
+        return fail(f"local read error: {exc}")
+
+    # 3. Map to the on-device Android path (fails closed on any traversal risk).
+    try:
+        android = map_remote_to_android(remote_path, android_root)
+    except DeletionError as exc:
+        return fail(str(exc), action="map")
+
+    # 4. Phone verification — every probe must affirmatively pass, else keep.
+    symlink = adb.is_symlink(android)
+    if symlink is not False:  # True (symlink) or None (ambiguous)
+        return fail("phone path is a symlink or ambiguous")
+
+    typesize = adb.stat_type_size(android)
+    if typesize is None:
+        present = adb.exists(android)
+        if present is False:
+            # The source is already gone (e.g. removed on a prior run before its
+            # bookkeeping committed). Not a failure: record and move on.
+            manifest.mark_deletion(import_id, "source_absent", None, deleted_at=now_iso())
+            manifest.record_deletion_event(import_id, fp, storage, remote_path,
+                                           "verify_absent", "absent", None, run_id)
+            log.info("source already absent %s", os.path.basename(remote_path))
+            return "absent"
+        return fail("phone stat ambiguous")
+    ftype, fsize = typesize
+    if ftype != "regular file":
+        return fail("phone path is not a regular file")
+    if fsize != size:
+        return fail("phone size mismatch (source changed)")
+
+    phone_sha = adb.sha256(android)
+    if phone_sha is None:
+        return fail("phone sha ambiguous")
+    if phone_sha != sha:
+        return fail("phone sha mismatch (source changed)")
+
+    # 5. Delete exactly this one, fully re-verified, regular file.
+    try:
+        adb.delete_regular_file(android)
+    except AdbError as exc:
+        return fail(f"rm failed: {exc}", action="delete")
+
+    # 6. Prove absence before recording success.
+    gone = adb.exists(android)
+    if gone is False:
+        manifest.mark_deletion(import_id, "deleted", None, deleted_at=now_iso())
+        manifest.record_deletion_event(import_id, fp, storage, remote_path,
+                                       "delete", "ok", None, run_id)
+        log.info("deleted source %s", os.path.basename(remote_path))
+        return "deleted"
+    # Present or ambiguous after rm: keep, marked for retry on the next run.
+    return fail("still present after rm", action="delete")
 
 
 # --- Pull success detection --------------------------------------------------
@@ -1205,7 +1688,9 @@ def do_dry_run(cli: CLI, dest: str, mount: str, device_id: str, model: str,
 def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
            fp: str, storage: str, roots: list[str], max_depth: int,
            min_free_gib: float, pull_timeout: int,
-           storage_used: int | None = None, helper: str | None = None) -> int:
+           storage_used: int | None = None, helper: str | None = None,
+           adb: "Adb | None" = None, android_root: str = "/sdcard",
+           delete_after_verify: bool = False) -> int:
     run_id = manifest.start_run("run", fp, storage, dest)
     incoming_dir = os.path.join(dest, BACKUP_DIRNAME, "incoming", run_id)
     quarantine_dir = os.path.join(dest, BACKUP_DIRNAME, "quarantine", run_id)
@@ -1254,14 +1739,53 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
             else:
                 failed += 1
 
-        status = "ok" if failed == 0 else "partial"
-        notes = f"transferred={transferred} skipped={skipped} failed={failed}"
+        # Source-deletion pass (only when explicitly armed). Runs AFTER transfers
+        # and BEFORE finish_run so it covers both the rows already completed on a
+        # prior run AND files transferred earlier in THIS run: upsert_completed
+        # commits per file, and reconcile guarantees every still-'completed' row
+        # has a present, correct-size local copy. Each file is independently
+        # re-verified inside delete_source_for_row before its one `rm --`.
+        deleted = delete_failed = already_absent = 0
+        if delete_after_verify and adb is not None:
+            pending_del = manifest.rows_pending_deletion(fp, storage)
+            log.info("delete-after-verify: %d candidate source file(s)", len(pending_del))
+            for row in pending_del:
+                try:
+                    outcome = delete_source_for_row(adb, manifest, dest, row,
+                                                    android_root, run_id)
+                except AdbError as exc:
+                    # A transport-level adb failure (e.g. cable pulled): keep the
+                    # file, mark it for retry, and stop the pass — the device is
+                    # likely gone, so hammering it further is pointless and unsafe.
+                    manifest.mark_deletion(row["id"], "delete_failed", f"adb error: {exc}")
+                    manifest.record_deletion_event(row["id"], fp, storage,
+                                                   row["remote_path"], "delete", "failed",
+                                                   f"adb error: {exc}", run_id)
+                    delete_failed += 1
+                    log.error("adb error during deletion pass; aborting remaining "
+                              "deletions: %s", exc)
+                    break
+                if outcome == "deleted":
+                    deleted += 1
+                elif outcome == "absent":
+                    already_absent += 1
+                elif outcome == "failed":
+                    delete_failed += 1
+                # 'skip' counts as neither success nor failure.
+
+        run_failed = failed > 0 or delete_failed > 0
+        status = "ok" if not run_failed else "partial"
+        notes = (f"transferred={transferred} skipped={skipped} failed={failed} "
+                 f"deleted={deleted} delete_failed={delete_failed} "
+                 f"already_absent={already_absent}")
         manifest.finish_run(run_id, status, notes)
-        print(f"Done. transferred={transferred} skipped={skipped} failed={failed}")
+        print(f"Done. transferred={transferred} skipped={skipped} failed={failed} "
+              f"deleted={deleted} delete_failed={delete_failed} "
+              f"already_absent={already_absent}")
         if warnings:
             for root, msg in warnings:
                 print(f"  ! source {root} skipped: {msg}")
-        return EXIT_OK if failed == 0 else EXIT_TRANSFER
+        return EXIT_OK if not run_failed else EXIT_TRANSFER
     except Exception as exc:
         manifest.finish_run(run_id, "error", str(exc))
         raise
@@ -1551,12 +2075,35 @@ def build_parser() -> argparse.ArgumentParser:
                         "$SWIFTMTP_MTPINV, bin/mtpinv/mtpinv next to this script, or $PATH). "
                         "The helper works around the stock `swiftmtp-cli ls` returning empty "
                         "listings; build it with bin/mtpinv/build.sh.")
+    p.add_argument("--delete-after-verify", action="store_true",
+                   help="DELETE each source file FROM THE PHONE (via adb) after — and only "
+                        "after — its local backup is byte-verified AND the on-device file is "
+                        "re-verified byte-identical (size + SHA-256, non-symlink regular file). "
+                        "Requires --run; NEVER deletes in dry-run/verify. Removes only regular "
+                        "files, one at a time; any mismatch keeps the phone file.")
+    p.add_argument("--adb", default=(shutil.which("adb") or DEFAULT_ADB),
+                   help=f"path to the adb binary (default: adb on PATH, else {DEFAULT_ADB})")
+    p.add_argument("--adb-serial", default=None,
+                   help="explicit adb device serial; required when multiple authorized adb "
+                        "devices are connected")
+    p.add_argument("--android-root", default="/sdcard",
+                   help="Android filesystem root that the SELECTED MTP storage root maps to "
+                        "(default: /sdcard, i.e. internal shared storage). Must correspond to "
+                        "the storage chosen via --storage; on a multi-storage device pointing "
+                        "this at the wrong storage is guarded by the mandatory size+SHA-256 "
+                        "match (a non-identical file is never deleted).")
+    p.add_argument("--adb-timeout", type=int, default=60,
+                   help="timeout (s) per adb command (default: 60)")
     p.add_argument("-v", "--verbose", action="store_true", help="verbose console output")
     return p
 
 
 def main(argv: list[str]) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.delete_after_verify and not args.run:
+        # Fail closed: destruction is never allowed outside an explicit --run.
+        parser.error("--delete-after-verify requires --run")
     setup_console_logging(args.verbose)
 
     dest = os.path.abspath(os.path.expanduser(args.dest))
@@ -1617,9 +2164,17 @@ def main(argv: list[str]) -> int:
             setup_file_logging(dest)
             lock_fd = acquire_lock(dest)
             manifest = Manifest(db_path)
+            adb = None
+            if args.delete_after_verify:
+                # Arm deletion only after proving adb targets the SAME physical
+                # device we just backed up (see _prepare_adb_for_delete).
+                adb = _prepare_adb_for_delete(args.adb, args.adb_serial, device_id,
+                                              args.adb_timeout)
             return do_run(manifest, cli, dest, device_id, model, fp, storage,
                           roots, args.max_depth, args.min_free_gib, args.pull_timeout,
-                          guard_used, helper)
+                          guard_used, helper,
+                          adb=adb, android_root=args.android_root,
+                          delete_after_verify=args.delete_after_verify)
 
         # dry-run: read-only preview; creates no destination/manifest/logs/lock.
         completed = load_completed_map(db_path, fp, storage)
@@ -1633,7 +2188,7 @@ def main(argv: list[str]) -> int:
     except LockError as exc:
         log.error("%s", exc)
         return EXIT_LOCK
-    except (DeviceError, InventoryError) as exc:
+    except (DeviceError, InventoryError, AdbError) as exc:
         log.error("%s", exc)
         return EXIT_DEVICE
     except KeyboardInterrupt:
