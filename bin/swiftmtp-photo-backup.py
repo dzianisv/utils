@@ -1685,6 +1685,74 @@ def do_dry_run(cli: CLI, dest: str, mount: str, device_id: str, model: str,
     return EXIT_OK
 
 
+def run_deletion_pass(adb: "Adb", manifest: Manifest, dest: str, fp: str, storage: str,
+                      android_root: str, run_id: str) -> tuple[int, int, int]:
+    """Fail-closed deletion pass over completed rows still pending deletion.
+
+    Returns (deleted, delete_failed, already_absent). Each candidate is a row with
+    status 'completed' whose deletion has not yet succeeded; ``delete_source_for_row``
+    independently re-verifies the local backup AND the on-device file before its one
+    ``rm --`` and keeps the file on any mismatch. A transport-level adb failure aborts
+    the pass (the device is likely gone) after marking the current row for retry. This
+    is the single implementation shared by a full run and delete-only mode — no gate
+    differs between them.
+    """
+    deleted = delete_failed = already_absent = 0
+    pending_del = manifest.rows_pending_deletion(fp, storage)
+    log.info("delete-after-verify: %d candidate source file(s)", len(pending_del))
+    for row in pending_del:
+        try:
+            outcome = delete_source_for_row(adb, manifest, dest, row, android_root, run_id)
+        except AdbError as exc:
+            # A transport-level adb failure (e.g. cable pulled): keep the file, mark
+            # it for retry, and stop the pass — hammering a gone device is unsafe.
+            manifest.mark_deletion(row["id"], "delete_failed", f"adb error: {exc}")
+            manifest.record_deletion_event(row["id"], fp, storage, row["remote_path"],
+                                           "delete", "failed", f"adb error: {exc}", run_id)
+            delete_failed += 1
+            log.error("adb error during deletion pass; aborting remaining deletions: %s", exc)
+            break
+        if outcome == "deleted":
+            deleted += 1
+        elif outcome == "absent":
+            already_absent += 1
+        elif outcome == "failed":
+            delete_failed += 1
+        # 'skip' counts as neither success nor failure.
+    return deleted, delete_failed, already_absent
+
+
+def do_delete_only(manifest: Manifest, dest: str, fp: str, storage: str,
+                   adb: "Adb | None", android_root: str) -> int:
+    """Delete already-completed, locally-verified sources WITHOUT transferring.
+
+    Fast path to reclaim phone space immediately: skips inventory and the transfer
+    loop entirely and runs only the fail-closed deletion pass over rows already marked
+    'completed' (and still pending deletion). ``reconcile`` first requeues any completed
+    row whose local copy is missing or the wrong size, so only locally-valid backups are
+    eligible; ``delete_source_for_row`` then re-verifies each phone file (size + SHA-256,
+    non-symlink regular file) before its single ``rm --``. NO deletion gate is relaxed
+    relative to a full run — this only omits the (irrelevant) transfer work.
+    """
+    if adb is None:  # unreachable via main's guards; defensive fail-closed.
+        raise DeviceError("delete-only requires an armed adb device")
+    run_id = manifest.start_run("delete-only", fp, storage, dest)
+    try:
+        reconcile(manifest, dest, fp, storage)
+        deleted, delete_failed, already_absent = run_deletion_pass(
+            adb, manifest, dest, fp, storage, android_root, run_id)
+        run_failed = delete_failed > 0
+        notes = (f"transferred=0 skipped=0 failed=0 deleted={deleted} "
+                 f"delete_failed={delete_failed} already_absent={already_absent}")
+        manifest.finish_run(run_id, "ok" if not run_failed else "partial", notes)
+        print(f"Done (delete-only). transferred=0 skipped=0 failed=0 deleted={deleted} "
+              f"delete_failed={delete_failed} already_absent={already_absent}")
+        return EXIT_OK if not run_failed else EXIT_TRANSFER
+    except Exception as exc:
+        manifest.finish_run(run_id, "error", str(exc))
+        raise
+
+
 def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
            fp: str, storage: str, roots: list[str], max_depth: int,
            min_free_gib: float, pull_timeout: int,
@@ -1747,31 +1815,8 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
         # re-verified inside delete_source_for_row before its one `rm --`.
         deleted = delete_failed = already_absent = 0
         if delete_after_verify and adb is not None:
-            pending_del = manifest.rows_pending_deletion(fp, storage)
-            log.info("delete-after-verify: %d candidate source file(s)", len(pending_del))
-            for row in pending_del:
-                try:
-                    outcome = delete_source_for_row(adb, manifest, dest, row,
-                                                    android_root, run_id)
-                except AdbError as exc:
-                    # A transport-level adb failure (e.g. cable pulled): keep the
-                    # file, mark it for retry, and stop the pass — the device is
-                    # likely gone, so hammering it further is pointless and unsafe.
-                    manifest.mark_deletion(row["id"], "delete_failed", f"adb error: {exc}")
-                    manifest.record_deletion_event(row["id"], fp, storage,
-                                                   row["remote_path"], "delete", "failed",
-                                                   f"adb error: {exc}", run_id)
-                    delete_failed += 1
-                    log.error("adb error during deletion pass; aborting remaining "
-                              "deletions: %s", exc)
-                    break
-                if outcome == "deleted":
-                    deleted += 1
-                elif outcome == "absent":
-                    already_absent += 1
-                elif outcome == "failed":
-                    delete_failed += 1
-                # 'skip' counts as neither success nor failure.
+            deleted, delete_failed, already_absent = run_deletion_pass(
+                adb, manifest, dest, fp, storage, android_root, run_id)
 
         run_failed = failed > 0 or delete_failed > 0
         status = "ok" if not run_failed else "partial"
@@ -2094,6 +2139,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "match (a non-identical file is never deleted).")
     p.add_argument("--adb-timeout", type=int, default=60,
                    help="timeout (s) per adb command (default: 60)")
+    p.add_argument("--delete-only", action="store_true",
+                   help="delete already-completed, locally-verified source files from the phone "
+                        "WITHOUT transferring anything (skips inventory + the transfer loop). Use "
+                        "to reclaim phone space immediately for files already backed up. Requires "
+                        "--run --delete-after-verify; applies the exact same fail-closed deletion "
+                        "gates as a full run.")
     p.add_argument("-v", "--verbose", action="store_true", help="verbose console output")
     return p
 
@@ -2104,6 +2155,9 @@ def main(argv: list[str]) -> int:
     if args.delete_after_verify and not args.run:
         # Fail closed: destruction is never allowed outside an explicit --run.
         parser.error("--delete-after-verify requires --run")
+    if args.delete_only and not (args.run and args.delete_after_verify):
+        # delete-only still deletes, so keep the destructive intent fully explicit.
+        parser.error("--delete-only requires --run --delete-after-verify")
     setup_console_logging(args.verbose)
 
     dest = os.path.abspath(os.path.expanduser(args.dest))
@@ -2170,6 +2224,10 @@ def main(argv: list[str]) -> int:
                 # device we just backed up (see _prepare_adb_for_delete).
                 adb = _prepare_adb_for_delete(args.adb, args.adb_serial, device_id,
                                               args.adb_timeout)
+            if args.delete_only:
+                # Reclaim phone space now: reconcile + delete already-completed,
+                # locally-verified sources without transferring. Same gates as a full run.
+                return do_delete_only(manifest, dest, fp, storage, adb, args.android_root)
             return do_run(manifest, cli, dest, device_id, model, fp, storage,
                           roots, args.max_depth, args.min_free_gib, args.pull_timeout,
                           guard_used, helper,
