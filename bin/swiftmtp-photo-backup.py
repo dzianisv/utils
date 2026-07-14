@@ -91,6 +91,16 @@ DEFAULT_MIN_FREE_GIB = 10.0
 BACKUP_DIRNAME = ".swiftmtp-backup"
 GIB = 1024 ** 3
 
+# Fail-closed guard against a silent false-empty backup. If the device storage
+# reports at least this many bytes in use yet the inventory finds ZERO media in
+# every (existing) source root, the empty listing is far more likely a stock
+# `swiftmtp-cli ls` failure — it can return no output at all for directories that
+# demonstrably exist on the device (path resolution and `pull` still work) — than a
+# genuinely empty phone. Reporting "0 files, Done" in that state is dangerous for a
+# backup tool, so we refuse it. A truly empty device can override with
+# --allow-empty-inventory.
+EMPTY_INVENTORY_USED_FLOOR = 1 * GIB
+
 # Media extensions we back up (case-insensitive), per requirements.
 MEDIA_EXTS = {
     "jpg", "jpeg", "heic", "heif", "png", "webp", "gif",
@@ -287,6 +297,34 @@ def parse_storages(stdout: str) -> list[tuple[str, str]]:
     return storages
 
 
+# `storages` prints usage as "<name> (<free> free / <total> total)", e.g.
+# "Internal shared storage (737.51 MB free / 109.47 GB total)". Parsed best-effort
+# only to power the empty-inventory guard; any failure yields None so the guard
+# simply does not engage (never a hard error on an unfamiliar format).
+_SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+_STORAGE_USAGE_RE = re.compile(
+    r"\(\s*([\d.]+)\s*([KMGT]?B)\s+free\s*/\s*([\d.]+)\s*([KMGT]?B)\s+total\s*\)"
+)
+
+
+def storage_used_bytes(name: str) -> int | None:
+    """Best-effort used bytes (total - free) parsed from a `storages` display name.
+
+    Returns None when the free/total pattern is absent or unparseable — the caller
+    treats None as "unknown usage" and skips the guard rather than guessing.
+    """
+    m = _STORAGE_USAGE_RE.search(name)
+    if not m:
+        return None
+    try:
+        free = float(m.group(1)) * _SIZE_UNITS[m.group(2)]
+        total = float(m.group(3)) * _SIZE_UNITS[m.group(4)]
+    except (KeyError, ValueError):
+        return None
+    used = int(total - free)
+    return used if used >= 0 else None
+
+
 def device_fingerprint(device_id: str) -> str:
     return hashlib.sha256(device_id.encode("utf-8")).hexdigest()[:12]
 
@@ -339,7 +377,8 @@ def resolve_device(cli: CLI, requested: str | None) -> tuple[str, str]:
     )
 
 
-def resolve_storage(cli: CLI, device_id: str, requested: str | None) -> str:
+def resolve_storage(cli: CLI, device_id: str, requested: str | None) -> tuple[str, int | None]:
+    """Return (storage_id, used_bytes_or_None) for the selected storage."""
     rc, out, err = cli.run("storages", [device_id], cli.list_timeout)
     if "Error initializing device" in out or "Failed to fetch storages" in out:
         raise DeviceError(f"could not fetch storages: {out.strip() or err.strip()}")
@@ -349,12 +388,12 @@ def resolve_storage(cli: CLI, device_id: str, requested: str | None) -> str:
     if not storages:
         raise DeviceError("device reported no usable storage")
     if requested:
-        for sid, _name in storages:
+        for sid, name in storages:
             if sid == requested:
-                return sid
+                return sid, storage_used_bytes(name)
         raise DeviceError(f"--storage {requested!r} not found on device")
     if len(storages) == 1:
-        return storages[0][0]
+        return storages[0][0], storage_used_bytes(storages[0][1])
     listing = "\n".join(f"  {sid}  {name}" for sid, name in storages)
     raise DeviceError("Multiple storages found; select one with --storage <id>:\n" + listing)
 
@@ -523,7 +562,8 @@ def walk_root(cli: CLI, device_id: str, storage_id: str, root: str,
 
 
 def inventory(cli: CLI, device_id: str, storage_id: str, roots: list[str],
-              max_depth: int) -> tuple[list[MediaFile], list[tuple[str, str]]]:
+              max_depth: int, storage_used: int | None = None
+              ) -> tuple[list[MediaFile], list[tuple[str, str]]]:
     media: list[MediaFile] = []
     warnings: list[tuple[str, str]] = []
     ok_roots = 0
@@ -538,6 +578,27 @@ def inventory(cli: CLI, device_id: str, storage_id: str, roots: list[str],
         # DeviceError propagates: a lost connection is a hard failure.
     if ok_roots == 0:
         raise InventoryError("no source root could be inventoried")
+    # Fail closed on an implausible empty inventory: every source root listed
+    # successfully (no DirListError) but yielded zero media, while the device
+    # reports substantial storage in use. That combination is the signature of a
+    # `swiftmtp-cli ls` that returns empty output for directories that actually
+    # exist — not a genuinely empty device — so refuse to report a false-empty
+    # backup rather than silently "succeeding" with nothing.
+    if (not media
+            and storage_used is not None
+            and storage_used > EMPTY_INVENTORY_USED_FLOOR):
+        raise InventoryError(
+            "no media found in any source root (" + ", ".join(roots) + "), but the "
+            "device reports ~" + human_bytes(storage_used) + " of storage in use. "
+            "This is the signature of a stock `swiftmtp-cli ls` that returns an empty "
+            "listing for directories that exist on the device (path resolution and `pull` "
+            "still work), so the inventory cannot be trusted. Refusing to report an empty "
+            "backup. Verify the CLI directly, e.g.: "
+            "swiftmtp-cli ls <deviceId> <storageId> /DCIM  — if it prints nothing for a "
+            "folder that has photos, the CLI listing is broken (upgrade SwiftMTP / "
+            "swiftmtp-cli). If this device genuinely has no photos in these folders, re-run "
+            "with --allow-empty-inventory."
+        )
     return media, warnings
 
 
@@ -977,10 +1038,11 @@ def load_completed_map(db_path: str, fp: str, storage: str) -> dict:
 
 def do_dry_run(cli: CLI, dest: str, mount: str, device_id: str, model: str,
                fp: str, storage: str, roots: list[str], max_depth: int,
-               min_free_gib: float, completed: dict) -> int:
+               min_free_gib: float, completed: dict,
+               storage_used: int | None = None) -> int:
     """Preview only. Reads the device and an EXISTING manifest; writes nothing and
     never creates the destination, manifest, logs, or lock."""
-    files, warnings = inventory(cli, device_id, storage, roots, max_depth)
+    files, warnings = inventory(cli, device_id, storage, roots, max_depth, storage_used)
     device_dir = f"{sanitize_component(model)}-{fp}"
     pending, done_bytes, pending_bytes = [], 0, 0
     for f in files:
@@ -1030,7 +1092,8 @@ def do_dry_run(cli: CLI, dest: str, mount: str, device_id: str, model: str,
 
 def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
            fp: str, storage: str, roots: list[str], max_depth: int,
-           min_free_gib: float, pull_timeout: int) -> int:
+           min_free_gib: float, pull_timeout: int,
+           storage_used: int | None = None) -> int:
     run_id = manifest.start_run("run", fp, storage, dest)
     incoming_dir = os.path.join(dest, BACKUP_DIRNAME, "incoming", run_id)
     quarantine_dir = os.path.join(dest, BACKUP_DIRNAME, "quarantine", run_id)
@@ -1038,7 +1101,7 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
     device_dir = f"{sanitize_component(model)}-{fp}"
     transferred = failed = skipped = 0
     try:
-        files, warnings = inventory(cli, device_id, storage, roots, max_depth)
+        files, warnings = inventory(cli, device_id, storage, roots, max_depth, storage_used)
         manifest.record_observations(run_id, fp, storage, files)
         reconcile(manifest, dest, fp, storage)
         pending, done_bytes, pending_bytes = partition_pending(manifest, fp, storage, files)
@@ -1366,6 +1429,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-aft-check", action="store_true",
                    help="skip the Android File Transfer conflict preflight (override only if you "
                         "know its agent won't grab the device)")
+    p.add_argument("--allow-empty-inventory", action="store_true",
+                   help="proceed even when no media is found while the device reports storage in "
+                        "use (by default this is treated as a likely `swiftmtp-cli ls` failure and "
+                        "refused). Use only for a device that genuinely has no photos/videos in the "
+                        "source roots.")
     p.add_argument("-v", "--verbose", action="store_true", help="verbose console output")
     return p
 
@@ -1411,9 +1479,12 @@ def main(argv: list[str]) -> int:
         for part in device_id.split("|")[2:]:
             register_secret(part)  # serial number(s)
         fp = device_fingerprint(device_id)
-        storage = resolve_storage(cli, device_id, args.storage)
+        storage, storage_used = resolve_storage(cli, device_id, args.storage)
         log.info("device fp=%s model=%s storage=%s", fp, model, storage)
         db_path = os.path.join(dest, BACKUP_DIRNAME, "manifest.sqlite3")
+        # The empty-inventory guard uses reported storage usage as its trust signal;
+        # --allow-empty-inventory disables it by withholding that signal.
+        guard_used = None if args.allow_empty_inventory else storage_used
 
         if mode == "run":
             ensure_destination(dest, mount)
@@ -1421,12 +1492,14 @@ def main(argv: list[str]) -> int:
             lock_fd = acquire_lock(dest)
             manifest = Manifest(db_path)
             return do_run(manifest, cli, dest, device_id, model, fp, storage,
-                          roots, args.max_depth, args.min_free_gib, args.pull_timeout)
+                          roots, args.max_depth, args.min_free_gib, args.pull_timeout,
+                          guard_used)
 
         # dry-run: read-only preview; creates no destination/manifest/logs/lock.
         completed = load_completed_map(db_path, fp, storage)
         return do_dry_run(cli, dest, mount, device_id, model, fp, storage,
-                          roots, args.max_depth, args.min_free_gib, completed)
+                          roots, args.max_depth, args.min_free_gib, completed,
+                          guard_used)
 
     except PreflightError as exc:
         log.error("preflight: %s", exc)
