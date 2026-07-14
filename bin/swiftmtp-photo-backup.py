@@ -17,6 +17,13 @@ Safety contract
   device-reported size, its SHA-256 was computed, the bytes were fsync'd, and the
   file was atomically renamed into place on the same volume.
 * Default mode is a dry run. Transfers only happen with ``--run``.
+* ``--dry-run`` and ``--verify`` are side-effect free with respect to production
+  state: they never create the destination directory, the SQLite manifest, log
+  files, or the lock. Dry-run reads the device plus an existing manifest (if any);
+  verify needs neither the phone nor the CLI and, when the destination or manifest
+  is absent, exits 0 with a "nothing to verify" message and no filesystem changes.
+  (An existing manifest is opened normally so verify can record its usual
+  requeue/status and log output.)
 
 Parsing the stock ``ls`` output (known limitations)
 ---------------------------------------------------
@@ -846,19 +853,24 @@ def check_android_file_transfer() -> None:
             )
 
 
-def check_destination(dest: str, mount: str, allow_unmounted: bool) -> None:
+def check_mount(mount: str, allow_unmounted: bool) -> None:
+    """Verify the destination volume is mounted. Read-only: creates nothing."""
     if not os.path.isdir(mount):
         raise PreflightError(
             f"destination volume {mount} is not mounted (directory missing). "
             "Plug in / mount the backup drive."
         )
-    if not allow_unmounted:
-        if not os.path.ismount(mount):
-            raise PreflightError(
-                f"{mount} exists but is NOT a mounted volume — refusing to write to an "
-                "ordinary directory accidentally created under /Volumes. Mount the real "
-                "volume (or pass --allow-unmounted-dest for testing)."
-            )
+    if not allow_unmounted and not os.path.ismount(mount):
+        raise PreflightError(
+            f"{mount} exists but is NOT a mounted volume — refusing to write to an "
+            "ordinary directory accidentally created under /Volumes. Mount the real "
+            "volume (or pass --allow-unmounted-dest for testing)."
+        )
+
+
+def ensure_destination(dest: str, mount: str) -> None:
+    """Create DEST under the (already-checked) mount and prove it is writable and
+    contained. Only for modes that actually write backups (i.e. --run)."""
     try:
         os.makedirs(dest, exist_ok=True)
     except OSError as exc:
@@ -882,6 +894,11 @@ def check_destination(dest: str, mount: str, allow_unmounted: bool) -> None:
 def free_bytes(path: str) -> int:
     st = os.statvfs(path)
     return st.f_frsize * st.f_bavail
+
+
+def free_bytes_for(dest: str, mount: str) -> int:
+    """Free bytes on the destination volume without requiring DEST itself to exist."""
+    return free_bytes(dest if os.path.isdir(dest) else mount)
 
 
 def acquire_lock(dest: str):
@@ -926,47 +943,82 @@ def partition_pending(manifest: Manifest, fp: str, storage: str,
     return pending, done_bytes, pending_bytes
 
 
-def do_dry_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
-               fp: str, storage: str, roots: list[str], max_depth: int,
-               min_free_gib: float) -> int:
-    run_id = manifest.start_run("dry-run", fp, storage, dest)
-    try:
-        files, warnings = inventory(cli, device_id, storage, roots, max_depth)
-        manifest.record_observations(run_id, fp, storage, files)
-        reconcile(manifest, dest, fp, storage)
-        pending, done_bytes, pending_bytes = partition_pending(manifest, fp, storage, files)
-        avail = free_bytes(dest)
-        reserve = int(min_free_gib * GIB)
-        device_dir = f"{sanitize_component(model)}-{fp}"
+def load_completed_map(db_path: str, fp: str, storage: str) -> dict:
+    """Read {(remote_path,size,modified): local_relpath} for completed imports.
 
-        print("── swiftmtp-photo-backup (DRY RUN) ─────────────────────────────")
-        print(f"device fp     : {fp}  model: {model}")
-        print(f"storage       : {storage}")
-        print(f"destination   : {dest}")
-        print(f"sources       : {', '.join(roots)}")
-        print(f"media found   : {len(files)} files, {human_bytes(done_bytes + pending_bytes)}")
-        print(f"already backed: {len(files) - len(pending)} files, {human_bytes(done_bytes)}")
-        print(f"pending       : {len(pending)} files, {human_bytes(pending_bytes)}")
-        print(f"free space    : {human_bytes(avail)} (reserve {human_bytes(reserve)})")
-        usable = avail - reserve
-        print(f"usable        : {human_bytes(max(0, usable))}")
-        if warnings:
-            for root, msg in warnings:
-                print(f"  ! source {root} skipped: {msg}")
-        for f in pending[:20]:
-            final = build_final_path(dest, device_dir, storage, f.remote_path)
-            print(f"  + {f.remote_path} -> {os.path.relpath(final, dest)} ({human_bytes(f.size)})")
-        if len(pending) > 20:
-            print(f"  … and {len(pending) - 20} more")
-        if pending_bytes > usable:
-            print("RESULT: pending bytes EXCEED usable space; --run would be refused.")
+    Read-only and side-effect free for dry runs: returns {} (and creates nothing)
+    when the manifest file is absent, unreadable, or has no imports table yet.
+    """
+    result: dict = {}
+    if not os.path.isfile(db_path):
+        return result
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error:
+        return result
+    try:
+        cur = conn.execute(
+            "SELECT remote_path, size, modified, local_relpath FROM imports "
+            "WHERE status='completed' AND device_fingerprint=? AND storage_id=?",
+            (fp, storage),
+        )
+        for rp, sz, mod, rel in cur.fetchall():
+            result[(rp, sz, mod)] = rel
+    except sqlite3.Error:
+        pass  # missing/older schema -> treat as nothing completed
+    finally:
+        conn.close()
+    return result
+
+
+def do_dry_run(cli: CLI, dest: str, mount: str, device_id: str, model: str,
+               fp: str, storage: str, roots: list[str], max_depth: int,
+               min_free_gib: float, completed: dict) -> int:
+    """Preview only. Reads the device and an EXISTING manifest; writes nothing and
+    never creates the destination, manifest, logs, or lock."""
+    files, warnings = inventory(cli, device_id, storage, roots, max_depth)
+    device_dir = f"{sanitize_component(model)}-{fp}"
+    pending, done_bytes, pending_bytes = [], 0, 0
+    for f in files:
+        rel = completed.get((f.remote_path, f.size, f.modified))
+        backed_up = False
+        if rel:  # read-only reconcile: only "done" if the local file is really there
+            local = os.path.join(dest, rel)
+            if os.path.isfile(local) and os.path.getsize(local) == f.size:
+                backed_up = True
+        if backed_up:
+            done_bytes += f.size
         else:
-            print("RESULT: OK — re-run with --run to transfer.")
-        manifest.finish_run(run_id, "ok", f"pending={len(pending)}")
-        return EXIT_OK
-    except Exception as exc:
-        manifest.finish_run(run_id, "error", str(exc))
-        raise
+            pending.append(f)
+            pending_bytes += f.size
+    avail = free_bytes_for(dest, mount)
+    reserve = int(min_free_gib * GIB)
+    usable = avail - reserve
+    dest_note = "" if os.path.isdir(dest) else "  (would be created on --run)"
+
+    print("── swiftmtp-photo-backup (DRY RUN — no changes written) ────────")
+    print(f"device fp     : {fp}  model: {model}")
+    print(f"storage       : {storage}")
+    print(f"destination   : {dest}{dest_note}")
+    print(f"sources       : {', '.join(roots)}")
+    print(f"media found   : {len(files)} files, {human_bytes(done_bytes + pending_bytes)}")
+    print(f"already backed: {len(files) - len(pending)} files, {human_bytes(done_bytes)}")
+    print(f"pending       : {len(pending)} files, {human_bytes(pending_bytes)}")
+    print(f"free space    : {human_bytes(avail)} (reserve {human_bytes(reserve)})")
+    print(f"usable        : {human_bytes(max(0, usable))}")
+    if warnings:
+        for root, msg in warnings:
+            print(f"  ! source {root} skipped: {msg}")
+    for f in pending[:20]:
+        final = build_final_path(dest, device_dir, storage, f.remote_path)
+        print(f"  + {f.remote_path} -> {os.path.relpath(final, dest)} ({human_bytes(f.size)})")
+    if len(pending) > 20:
+        print(f"  … and {len(pending) - 20} more")
+    if pending_bytes > usable:
+        print("RESULT: pending bytes EXCEED usable space; --run would be refused.")
+    else:
+        print("RESULT: OK — re-run with --run to transfer.")
+    return EXIT_OK
 
 
 def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
@@ -1217,7 +1269,8 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--run", action="store_true", help="perform transfers (default is dry run)")
     mode.add_argument("--dry-run", action="store_true", help="preview only (default)")
     mode.add_argument("--verify", action="store_true",
-                      help="recheck all completed local files (size + SHA-256); no device needed")
+                      help="recheck completed local files (size + SHA-256); no phone/CLI needed; "
+                           "creates nothing if there is no destination/manifest yet")
 
     p.add_argument("--min-free-gib", type=float, default=DEFAULT_MIN_FREE_GIB,
                    help=f"free-space reserve on destination (default: {DEFAULT_MIN_FREE_GIB} GiB)")
@@ -1248,22 +1301,28 @@ def main(argv: list[str]) -> int:
     lock_fd = None
     manifest = None
     try:
-        # Preflight: destination first (needed for logs/manifest/lock in every mode).
-        check_destination(dest, mount, args.allow_unmounted_dest)
-        setup_file_logging(dest)
-        lock_fd = acquire_lock(dest)
-
-        db_path = os.path.join(dest, BACKUP_DIRNAME, "manifest.sqlite3")
-        manifest = Manifest(db_path)
-
         if mode == "verify":
+            # Phone/CLI/AFT-independent and side-effect free when there is nothing
+            # to verify: never create the destination or the manifest.
+            if not os.path.isdir(dest):
+                print(f"nothing to verify: destination {dest} does not exist (no local backups).")
+                return EXIT_OK
+            db_path = os.path.join(dest, BACKUP_DIRNAME, "manifest.sqlite3")
+            if not os.path.isfile(db_path):
+                print(f"nothing to verify: no manifest at {db_path} (nothing backed up here yet).")
+                return EXIT_OK
+            # Manifest exists: verify may write its normal status/logs.
+            setup_file_logging(dest)
+            lock_fd = acquire_lock(dest)
+            manifest = Manifest(db_path)
             log.info("verify mode: rechecking completed local files under %s", dest)
             return do_verify(manifest, dest)
 
-        # Device-touching modes.
+        # run / dry-run touch the device.
         check_cli(args.cli)
         if not args.skip_aft_check:
             check_android_file_transfer()
+        check_mount(mount, args.allow_unmounted_dest)
         cli = CLI(args.cli, args.list_timeout)
 
         device_id, model = resolve_device(cli, args.device)
@@ -1273,12 +1332,20 @@ def main(argv: list[str]) -> int:
         fp = device_fingerprint(device_id)
         storage = resolve_storage(cli, device_id, args.storage)
         log.info("device fp=%s model=%s storage=%s", fp, model, storage)
+        db_path = os.path.join(dest, BACKUP_DIRNAME, "manifest.sqlite3")
 
         if mode == "run":
+            ensure_destination(dest, mount)
+            setup_file_logging(dest)
+            lock_fd = acquire_lock(dest)
+            manifest = Manifest(db_path)
             return do_run(manifest, cli, dest, device_id, model, fp, storage,
                           roots, args.max_depth, args.min_free_gib, args.pull_timeout)
-        return do_dry_run(manifest, cli, dest, device_id, model, fp, storage,
-                          roots, args.max_depth, args.min_free_gib)
+
+        # dry-run: read-only preview; creates no destination/manifest/logs/lock.
+        completed = load_completed_map(db_path, fp, storage)
+        return do_dry_run(cli, dest, mount, device_id, model, fp, storage,
+                          roots, args.max_depth, args.min_free_gib, completed)
 
     except PreflightError as exc:
         log.error("preflight: %s", exc)
