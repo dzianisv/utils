@@ -76,6 +76,7 @@ import logging
 import os
 import re
 import sqlite3
+import shutil
 import subprocess
 import sys
 import uuid
@@ -100,6 +101,13 @@ GIB = 1024 ** 3
 # backup tool, so we refuse it. A truly empty device can override with
 # --allow-empty-inventory.
 EMPTY_INVENTORY_USED_FLOOR = 1 * GIB
+
+# The native MTP inventory helper (see bin/mtpinv/). It talks to the device with
+# the same go-mtpx library SwiftMTP bundles, but WITHOUT the stock CLI's broken
+# stale-generation `ls` wrapper, so it enumerates reliably and emits JSON. It is
+# read-only with respect to the device. Discovered next to this script by default.
+MTP_HELPER_DIRNAME = "mtpinv"
+DEFAULT_HELPER_TIMEOUT = 900  # seconds for a full recursive metadata walk
 
 # Media extensions we back up (case-insensitive), per requirements.
 MEDIA_EXTS = {
@@ -561,9 +569,106 @@ def walk_root(cli: CLI, device_id: str, storage_id: str, root: str,
                 out.append(MediaFile(child, entry.name, entry.size, entry.modified, root))
 
 
-def inventory(cli: CLI, device_id: str, storage_id: str, roots: list[str],
-              max_depth: int, storage_used: int | None = None
-              ) -> tuple[list[MediaFile], list[tuple[str, str]]]:
+def resolve_mtp_helper(explicit: str | None) -> str | None:
+    """Locate the native mtpinv helper binary, or None if unavailable.
+
+    Search order: explicit --mtp-helper, $SWIFTMTP_MTPINV, bin/mtpinv/mtpinv next
+    to this script, then $PATH. Returns an executable path or None.
+    """
+    candidates: list[str] = []
+    if explicit:
+        candidates.append(os.path.abspath(os.path.expanduser(explicit)))
+    env = os.environ.get("SWIFTMTP_MTPINV")
+    if env:
+        candidates.append(os.path.abspath(os.path.expanduser(env)))
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(here, MTP_HELPER_DIRNAME, "mtpinv"))
+    on_path = shutil.which("mtpinv")
+    if on_path:
+        candidates.append(on_path)
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def _root_for(remote_path: str, roots: list[str]) -> str | None:
+    """Return the source root that contains remote_path, or None (containment)."""
+    for root in roots:
+        base = root.rstrip("/")
+        if remote_path == base or remote_path.startswith(base + "/"):
+            return root
+    return None
+
+
+def helper_inventory(helper_path: str, storage_id: str, roots: list[str],
+                     timeout: int = DEFAULT_HELPER_TIMEOUT
+                     ) -> tuple[list[MediaFile], list[tuple[str, str]]]:
+    """Enumerate media via the native mtpinv helper (JSON). Read-only on device.
+
+    JSON avoids the fixed-width `ls` ambiguity entirely: names/sizes/paths are
+    delimited unambiguously. We still fail closed per entry — only well-formed
+    media whose path is contained under a requested root is trusted.
+    """
+    cmd = [helper_path, "-storage", str(storage_id), "inventory", *roots]
+    log.debug("exec helper: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=timeout, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        raise DeviceError(f"mtp helper inventory timed out after {timeout}s")
+    except OSError as exc:
+        raise InventoryError(f"could not run mtp helper {helper_path}: {exc}")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip()
+        raise InventoryError(f"mtp helper inventory failed: {detail}")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise InventoryError(f"mtp helper returned invalid JSON: {exc}")
+
+    media: list[MediaFile] = []
+    for entry in data.get("files", []):
+        if not isinstance(entry, dict) or entry.get("is_dir"):
+            continue
+        name = entry.get("name") or ""
+        path = entry.get("path") or ""
+        size = entry.get("size")
+        # Fail-closed hygiene: never trust a name that could break local paths,
+        # a non-integer/negative size, a non-media file, or a path that escapes
+        # the requested roots.
+        if not name or not path or "\x00" in name or "/" in name:
+            continue
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            continue
+        if not is_media(name):
+            continue
+        root = _root_for(path, roots)
+        if root is None:
+            continue
+        media.append(MediaFile(path, name, size, str(entry.get("mtime") or ""), root))
+
+    warnings: list[tuple[str, str]] = []
+    for e in data.get("errors", []):
+        if isinstance(e, dict):
+            warnings.append((str(e.get("root", "")), str(e.get("error", ""))))
+    # Mirror the ls backend's "no source root could be inventoried" hard failure:
+    # if every requested root errored (and nothing was found), fail closed
+    # regardless of reported storage usage rather than returning a clean empty.
+    errored_roots = {r for r, _ in warnings}
+    if not media and set(roots) and errored_roots >= set(roots):
+        detail = "; ".join(f"{r}: {e}" for r, e in warnings[:3])
+        raise InventoryError(f"no source root could be inventoried: {detail}")
+    log.info("inventoried %d media file(s) across %s via native mtp helper",
+             len(media), ", ".join(roots))
+    return media, warnings
+
+
+def _ls_walk_inventory(cli: CLI, device_id: str, storage_id: str, roots: list[str],
+                       max_depth: int) -> tuple[list[MediaFile], list[tuple[str, str]]]:
     media: list[MediaFile] = []
     warnings: list[tuple[str, str]] = []
     ok_roots = 0
@@ -571,32 +676,39 @@ def inventory(cli: CLI, device_id: str, storage_id: str, roots: list[str],
         try:
             walk_root(cli, device_id, storage_id, root, media, max_depth)
             ok_roots += 1
-            log.info("inventoried %s", root)
+            log.info("inventoried %s (swiftmtp-cli ls)", root)
         except DirListError as exc:
             warnings.append((root, str(exc)))
             log.warning("source root %s unavailable (skipping): %s", root, exc)
         # DeviceError propagates: a lost connection is a hard failure.
     if ok_roots == 0:
         raise InventoryError("no source root could be inventoried")
-    # Fail closed on an implausible empty inventory: every source root listed
-    # successfully (no DirListError) but yielded zero media, while the device
-    # reports substantial storage in use. That combination is the signature of a
-    # `swiftmtp-cli ls` that returns empty output for directories that actually
-    # exist — not a genuinely empty device — so refuse to report a false-empty
-    # backup rather than silently "succeeding" with nothing.
+    return media, warnings
+
+
+def inventory(cli: CLI, device_id: str, storage_id: str, roots: list[str],
+              max_depth: int, storage_used: int | None = None,
+              helper: str | None = None
+              ) -> tuple[list[MediaFile], list[tuple[str, str]]]:
+    if helper is not None:
+        media, warnings = helper_inventory(helper, storage_id, roots)
+    else:
+        media, warnings = _ls_walk_inventory(cli, device_id, storage_id, roots, max_depth)
+    # Fail closed on an implausible empty inventory: the enumeration backend
+    # returned zero media while the device reports substantial storage in use.
+    # That is the signature of a failed listing (e.g. the stock `swiftmtp-cli ls`
+    # returning empty output for directories that actually exist) — not a
+    # genuinely empty device — so refuse to report a false-empty backup.
     if (not media
             and storage_used is not None
             and storage_used > EMPTY_INVENTORY_USED_FLOOR):
         raise InventoryError(
             "no media found in any source root (" + ", ".join(roots) + "), but the "
-            "device reports ~" + human_bytes(storage_used) + " of storage in use. "
-            "This is the signature of a stock `swiftmtp-cli ls` that returns an empty "
-            "listing for directories that exist on the device (path resolution and `pull` "
-            "still work), so the inventory cannot be trusted. Refusing to report an empty "
-            "backup. Verify the CLI directly, e.g.: "
-            "swiftmtp-cli ls <deviceId> <storageId> /DCIM  — if it prints nothing for a "
-            "folder that has photos, the CLI listing is broken (upgrade SwiftMTP / "
-            "swiftmtp-cli). If this device genuinely has no photos in these folders, re-run "
+            "device reports ~" + human_bytes(storage_used) + " of storage in use, so the "
+            "empty inventory cannot be trusted. This usually means the enumeration backend "
+            "failed (e.g. the stock `swiftmtp-cli ls` returns empty listings on this device; "
+            "build the native helper at bin/mtpinv/ — see its README). Refusing to report an "
+            "empty backup. If this device genuinely has no photos in these folders, re-run "
             "with --allow-empty-inventory."
         )
     return media, warnings
@@ -1039,10 +1151,10 @@ def load_completed_map(db_path: str, fp: str, storage: str) -> dict:
 def do_dry_run(cli: CLI, dest: str, mount: str, device_id: str, model: str,
                fp: str, storage: str, roots: list[str], max_depth: int,
                min_free_gib: float, completed: dict,
-               storage_used: int | None = None) -> int:
+               storage_used: int | None = None, helper: str | None = None) -> int:
     """Preview only. Reads the device and an EXISTING manifest; writes nothing and
     never creates the destination, manifest, logs, or lock."""
-    files, warnings = inventory(cli, device_id, storage, roots, max_depth, storage_used)
+    files, warnings = inventory(cli, device_id, storage, roots, max_depth, storage_used, helper)
     device_dir = f"{sanitize_component(model)}-{fp}"
     pending, done_bytes, pending_bytes = [], 0, 0
     for f in files:
@@ -1093,7 +1205,7 @@ def do_dry_run(cli: CLI, dest: str, mount: str, device_id: str, model: str,
 def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
            fp: str, storage: str, roots: list[str], max_depth: int,
            min_free_gib: float, pull_timeout: int,
-           storage_used: int | None = None) -> int:
+           storage_used: int | None = None, helper: str | None = None) -> int:
     run_id = manifest.start_run("run", fp, storage, dest)
     incoming_dir = os.path.join(dest, BACKUP_DIRNAME, "incoming", run_id)
     quarantine_dir = os.path.join(dest, BACKUP_DIRNAME, "quarantine", run_id)
@@ -1101,7 +1213,7 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
     device_dir = f"{sanitize_component(model)}-{fp}"
     transferred = failed = skipped = 0
     try:
-        files, warnings = inventory(cli, device_id, storage, roots, max_depth, storage_used)
+        files, warnings = inventory(cli, device_id, storage, roots, max_depth, storage_used, helper)
         manifest.record_observations(run_id, fp, storage, files)
         reconcile(manifest, dest, fp, storage)
         pending, done_bytes, pending_bytes = partition_pending(manifest, fp, storage, files)
@@ -1434,6 +1546,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "use (by default this is treated as a likely `swiftmtp-cli ls` failure and "
                         "refused). Use only for a device that genuinely has no photos/videos in the "
                         "source roots.")
+    p.add_argument("--mtp-helper", default=None, metavar="PATH",
+                   help="path to the native mtpinv enumeration helper (default: auto-discover "
+                        "$SWIFTMTP_MTPINV, bin/mtpinv/mtpinv next to this script, or $PATH). "
+                        "The helper works around the stock `swiftmtp-cli ls` returning empty "
+                        "listings; build it with bin/mtpinv/build.sh.")
     p.add_argument("-v", "--verbose", action="store_true", help="verbose console output")
     return p
 
@@ -1485,6 +1602,15 @@ def main(argv: list[str]) -> int:
         # The empty-inventory guard uses reported storage usage as its trust signal;
         # --allow-empty-inventory disables it by withholding that signal.
         guard_used = None if args.allow_empty_inventory else storage_used
+        # Prefer the native mtpinv helper for enumeration (the stock `ls` returns
+        # empty listings on some devices). Fall back to `ls` only if unavailable.
+        helper = resolve_mtp_helper(args.mtp_helper)
+        if helper:
+            log.info("inventory backend: native mtp helper (%s)", helper)
+        else:
+            log.warning("native mtp helper not found; falling back to `swiftmtp-cli ls` "
+                        "(returns empty listings on some devices). Build bin/mtpinv/mtpinv "
+                        "(see bin/mtpinv/README.md) or pass --mtp-helper PATH.")
 
         if mode == "run":
             ensure_destination(dest, mount)
@@ -1493,13 +1619,13 @@ def main(argv: list[str]) -> int:
             manifest = Manifest(db_path)
             return do_run(manifest, cli, dest, device_id, model, fp, storage,
                           roots, args.max_depth, args.min_free_gib, args.pull_timeout,
-                          guard_used)
+                          guard_used, helper)
 
         # dry-run: read-only preview; creates no destination/manifest/logs/lock.
         completed = load_completed_map(db_path, fp, storage)
         return do_dry_run(cli, dest, mount, device_id, model, fp, storage,
                           roots, args.max_depth, args.min_free_gib, completed,
-                          guard_used)
+                          guard_used, helper)
 
     except PreflightError as exc:
         log.error("preflight: %s", exc)

@@ -1,0 +1,3 @@
+# Built binary is machine/arch-specific and dynamically linked to libusb;
+# build it locally with ./build.sh instead of committing it.
+/mtpinv
