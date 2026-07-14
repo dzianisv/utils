@@ -18,6 +18,42 @@ Safety contract
   file was atomically renamed into place on the same volume.
 * Default mode is a dry run. Transfers only happen with ``--run``.
 
+Parsing the stock ``ls`` output (known limitations)
+---------------------------------------------------
+``swiftmtp-cli`` exposes no machine-readable listing; the only option is ``ls``,
+whose rows are fixed-width HUMAN columns produced by
+``print("\\(type) \\(paddedSize)  \\(dateStr)  \\(file.name)")`` in main.swift:
+a 5-char type, a min-width-12 size, a date padded/truncated to 20 *UTF-16* code
+units (verified empirically against Foundation's ``String.padding``), then the
+raw, UNQUOTED file name. This format is inherently ambiguous for arbitrary
+inputs, and this tool does NOT pretend otherwise:
+
+* a file name containing a newline is split across output lines;
+* the date is opaque and may be truncated, so it is used only as an opaque
+  per-file stability token and is never interpreted as a real timestamp;
+* the date column width is counted in UTF-16 units while this parser indexes by
+  Unicode scalar, so a non-BMP character inside a fixed column shifts offsets.
+
+Rather than guess, ``parse_ls_line`` enforces the exact structural invariants
+(notably the redundant two-space separator that must follow the 20-unit date).
+Any non-empty ``ls`` line that fails them is treated as ambiguous and the whole
+directory listing FAILS LOUDLY (``LsParseError``) instead of silently dropping
+or mis-attributing files. Rows that satisfy the invariants preserve their spaces
+and (BMP) Unicode exactly.
+
+Why not call the bundled ``gomtp`` ABI directly (it returns clean JSON)? Because
+MTP/USB access is gated on SwiftMTP.app's ``com.apple.security.device.usb``
+entitlement; an unentitled Python process loading ``gomtp.dylib`` cannot reach
+the device. Shelling out to the entitled ``swiftmtp-cli`` is therefore the only
+workable stdlib-only path, so the conservative parser is retained and fails
+closed.
+
+Live-device checks still to be confirmed on real hardware (do not block static
+use; the phone was disconnected during development): (1) single-file ``pull``
+destination semantics — expected to be "destination is a directory, output =
+destination/basename", which ``discover_pulled_file`` already tolerates; and
+(2) that real ``dateModified`` values stay ASCII within the 20-unit date column.
+
 Upstream reference: Neighbor-Z/SwiftMTP @ eff9a952a4f77eacde58037e0ec88b3b0bec856d
 (swiftmtp-cli/main.swift, swiftmtp-cli/CLI_USAGE.md).
 
@@ -86,6 +122,15 @@ class DirListError(Exception):
 
 class InventoryError(Exception):
     """The whole inventory failed."""
+
+
+class LsParseError(InventoryError):
+    """An `ls` listing produced output that could not be unambiguously parsed.
+
+    Raised (fail-closed) rather than silently dropping or mis-attributing a row,
+    e.g. a file name containing a newline, undecodable bytes, or non-BMP text in
+    a fixed-width column. Treated as an inventory failure (non-zero exit).
+    """
 
 
 # --- Logging & secret redaction ---------------------------------------------
@@ -303,7 +348,7 @@ def resolve_storage(cli: CLI, device_id: str, requested: str | None) -> str:
     raise DeviceError("Multiple storages found; select one with --storage <id>:\n" + listing)
 
 
-# --- ls output parsing (exact upstream format) -------------------------------
+# --- ls output parsing (strict, grounded in upstream source) -----------------
 # Upstream (swiftmtp-cli/main.swift) prints each entry as:
 #   "\(type) \(paddedSize)  \(dateStr)  \(file.name)"
 # where:
@@ -311,10 +356,15 @@ def resolve_storage(cli: CLI, device_id: str, requested: str | None) -> str:
 #   " "       = single separator space
 #   paddedSize= right-justified, min width 12, "-" for folders, decimal bytes
 #   "  "      = two-space separator
-#   dateStr   = date padded/truncated to EXACTLY 20 chars
+#   dateStr   = date padded/truncated to EXACTLY 20 UTF-16 units (opaque token)
 #   "  "      = two-space separator
-#   name      = file name (may contain spaces / Unicode)
-# Filenames may contain spaces, so we parse by the fixed structure, not by split.
+#   name      = raw, UNQUOTED file name (may contain spaces / Unicode)
+# This human format is NOT unambiguous for arbitrary names (see module docstring).
+# We parse by the fixed structure (never by whitespace splitting) and rely on the
+# redundant post-date two-space separator as a self-check: if the assumed widths
+# do not hold (e.g. non-BMP text shifting the UTF-16-counted date column), the
+# separator check fails and the row is rejected rather than mis-parsed. Callers
+# escalate any rejected non-empty line to a loud LsParseError (fail closed).
 
 class LsEntry:
     __slots__ = ("is_folder", "size", "modified", "name")
@@ -327,6 +377,13 @@ class LsEntry:
 
 
 def parse_ls_line(line: str) -> LsEntry | None:
+    """Parse one strict `ls` row, or return None if it is not an unambiguous row.
+
+    Returning None means "this line does not satisfy the exact upstream structure";
+    callers treat a non-empty None line as ambiguous and fail closed. Names that
+    parse are returned with spaces/Unicode preserved. The stored `modified` value
+    is the opaque 20-unit date token (rstripped), not a real timestamp.
+    """
     line = line.rstrip("\r\n")
     if len(line) < 6:
         return None
@@ -353,10 +410,16 @@ def parse_ls_line(line: str) -> LsEntry | None:
         return None
     date_field = body[:20]
     tail = body[20:]
-    if not tail.startswith("  "):
+    if not tail.startswith("  "):  # redundant separator: also guards width drift
         return None
     name = tail[2:]
     if not name:
+        return None
+    if "\ufffd" in name or "\ufffd" in date_field:
+        # U+FFFD means the CLI's stdout was not valid UTF-8 here: the name cannot
+        # be represented faithfully, so refuse to guess a local path for it.
+        return None
+    if "\x00" in name or "/" in name:  # never trust a name that could break paths
         return None
     if is_folder:
         size: int | None = None
@@ -399,15 +462,30 @@ def list_dir(cli: CLI, device_id: str, storage_id: str, path: str) -> list[LsEnt
         detail = out.strip() or err.strip() or f"rc={rc}"
         raise DirListError(detail)
     entries = []
+    bad_lines = []
     for line in out.split("\n"):
         if not line:
             continue
         entry = parse_ls_line(line)
         if entry is None:
-            if line.strip():
-                log.debug("unparsed ls line under %s: %r", path, line)
+            bad_lines.append(line)
             continue
         entries.append(entry)
+    if bad_lines:
+        # A successful ls (rc==0, no error string) whose every non-empty line is
+        # expected to be a valid entry. Any line that is not is ambiguous — it may
+        # be a newline within a file name (which also corrupts the adjacent parsed
+        # row), undecodable bytes, or unexpected output. Fail closed for this
+        # directory rather than trust a possibly-corrupted listing.
+        sample = _redact(bad_lines[0])
+        if len(sample) > 120:
+            sample = sample[:120] + "…"
+        raise LsParseError(
+            f"refusing to trust `ls` of {path}: {len(bad_lines)} line(s) did not match the "
+            f"strict swiftmtp-cli format (a file name may contain a newline or undecodable "
+            f"bytes, or a fixed column held non-BMP text). Not importing this listing to avoid "
+            f"mis-attributing files. First offending line: {sample!r}"
+        )
     return entries
 
 
