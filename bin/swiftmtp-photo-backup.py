@@ -119,6 +119,10 @@ class PreflightError(Exception):
     pass
 
 
+class LockError(Exception):
+    """Another run already holds the single-run lock."""
+
+
 class DeviceError(Exception):
     """The device connection/session failed (as opposed to a single dir)."""
 
@@ -911,7 +915,7 @@ def acquire_lock(dest: str):
     except OSError as exc:
         os.close(fd)
         if exc.errno in (errno.EACCES, errno.EAGAIN):
-            raise PreflightError("another swiftmtp-photo-backup run holds the lock")
+            raise LockError("another swiftmtp-photo-backup run holds the lock")
         raise
     os.ftruncate(fd, 0)
     os.write(fd, f"{os.getpid()} {now_iso()}\n".encode())
@@ -1057,6 +1061,14 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
                 failed += 1
                 log.error("device connection lost; aborting remaining transfers")
                 break
+            except (OSError, RuntimeError) as exc:
+                # Local filesystem / collision / hashing error for THIS file: record
+                # and keep going rather than aborting the whole run with a traceback.
+                manifest.mark_status(fp, storage, f, "failed",
+                                     f"local error: {type(exc).__name__}: {exc}", run_id)
+                failed += 1
+                log.error("local error backing up %s: %s", f.remote_path, exc)
+                continue
             if result == "transferred":
                 transferred += 1
             elif result == "skipped":
@@ -1064,7 +1076,6 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
             else:
                 failed += 1
 
-        _cleanup_dir(incoming_dir)
         status = "ok" if failed == 0 else "partial"
         notes = f"transferred={transferred} skipped={skipped} failed={failed}"
         manifest.finish_run(run_id, status, notes)
@@ -1076,11 +1087,19 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
     except Exception as exc:
         manifest.finish_run(run_id, "error", str(exc))
         raise
+    finally:
+        # Always remove this run's incoming staging area (any leftover .partial
+        # files or per-file subdirs), even on early return or exception.
+        _cleanup_dir(incoming_dir)
 
 
 def transfer_one(cli: CLI, manifest: Manifest, dest: str, device_id: str, device_dir: str,
                  fp: str, storage: str, f: MediaFile, incoming_dir: str, quarantine_dir: str,
                  run_id: str, pull_timeout: int) -> str:
+    """Pull one file and place it atomically. Raises only DeviceError; all local
+    filesystem/collision errors are converted to a recorded failed/quarantined
+    status (returns "failed"), and the per-file incoming staging is always cleaned.
+    """
     identity = f"{fp}|{storage}|{f.remote_path}|{f.size}|{f.modified}"
     id_hash = hashlib.sha256(identity.encode()).hexdigest()[:8]
     final_default = build_final_path(dest, device_dir, storage, f.remote_path)
@@ -1088,52 +1107,108 @@ def transfer_one(cli: CLI, manifest: Manifest, dest: str, device_id: str, device
     incoming_sub = os.path.join(incoming_dir, uuid.uuid4().hex)
     os.makedirs(incoming_sub, exist_ok=True)
     timeout = pull_timeout if pull_timeout > 0 else max(600, int(f.size / (150 * 1024)) + 600)
+    partial: str | None = None
+    try:
+        rc, out, _err = cli.run("pull", [device_id, storage, f.remote_path, incoming_sub], timeout)
+        if rc != 0 or not pull_reported_success(out):
+            manifest.mark_status(fp, storage, f, "failed",
+                                 f"pull did not report success (rc={rc})", run_id)
+            log.error("pull failed for %s", f.remote_path)
+            return "failed"
 
-    rc, out, err = cli.run("pull", [device_id, storage, f.remote_path, incoming_sub], timeout)
-    if rc != 0 or not pull_reported_success(out):
-        _cleanup_dir(incoming_sub)
-        manifest.mark_status(fp, storage, f, "failed",
-                             f"pull did not report success (rc={rc})", run_id)
-        log.error("pull failed for %s", f.remote_path)
-        return "failed"
+        produced = discover_pulled_file(incoming_sub, os.path.basename(f.remote_path))
+        if produced is None:
+            manifest.mark_status(fp, storage, f, "failed", "pulled output not found", run_id)
+            log.error("pulled output not discovered for %s", f.remote_path)
+            return "failed"
 
-    produced = discover_pulled_file(incoming_sub, os.path.basename(f.remote_path))
-    if produced is None:
-        _cleanup_dir(incoming_sub)
-        manifest.mark_status(fp, storage, f, "failed", "pulled output not found", run_id)
-        log.error("pulled output not discovered for %s", f.remote_path)
-        return "failed"
+        # Move to a unique .partial on the same volume before verifying.
+        partial = os.path.join(incoming_dir, f"{uuid.uuid4().hex}.partial")
+        os.replace(produced, partial)
 
-    # Move to a unique .partial on the same volume before verifying.
-    partial = os.path.join(incoming_dir, f"{uuid.uuid4().hex}.partial")
-    os.replace(produced, partial)
-    _cleanup_dir(incoming_sub)
+        actual_size = os.path.getsize(partial)
+        if actual_size != f.size:
+            _quarantine(partial, quarantine_dir, f, id_hash)
+            partial = None
+            manifest.mark_status(fp, storage, f, "quarantined",
+                                 f"size mismatch: expected {f.size}, got {actual_size}", run_id)
+            log.error("size mismatch for %s (expected %d, got %d)", f.remote_path, f.size, actual_size)
+            return "failed"
 
-    actual_size = os.path.getsize(partial)
-    if actual_size != f.size:
-        _quarantine(partial, quarantine_dir, f, id_hash)
-        manifest.mark_status(fp, storage, f, "quarantined",
-                             f"size mismatch: expected {f.size}, got {actual_size}", run_id)
-        log.error("size mismatch for %s (expected %d, got %d)", f.remote_path, f.size, actual_size)
-        return "failed"
+        sha = sha256_file(partial)
+        fsync_path(partial)
 
-    sha = sha256_file(partial)
-    fsync_path(partial)
+        kind, target = resolve_target(final_default, id_hash, f.size, sha)
+        if kind == "exists":
+            # Identical content already present at `target` — idempotent completion.
+            os.remove(partial)
+            partial = None
+            manifest.upsert_completed(fp, storage, f, sha, os.path.relpath(target, dest), run_id)
+            log.info("already present (identical) %s -> %s", f.remote_path, os.path.relpath(target, dest))
+            return "skipped"
 
-    kind, target = resolve_target(final_default, id_hash, f.size, sha)
-    if kind == "exists":
-        # Identical content already present at `target` — idempotent completion.
-        os.remove(partial)
+        # Deterministic handling of sanitized file-vs-directory collisions: if an
+        # ancestor directory we would need to create already exists as a FILE
+        # (because two different remote names sanitized to the same local path),
+        # do not crash — quarantine and fail just this file with a reproducible
+        # message. (The reverse — target leaf colliding with a directory — is
+        # handled by resolve_target picking a disambiguated sibling name.)
+        conflict = ancestor_file_conflict(target, dest)
+        if conflict is not None:
+            _quarantine(partial, quarantine_dir, f, id_hash)
+            partial = None
+            rel = os.path.relpath(conflict, dest)
+            manifest.mark_status(fp, storage, f, "quarantined",
+                                 f"path collision: '{rel}' already exists as a file, cannot create "
+                                 f"a directory there for {os.path.basename(target)}", run_id)
+            log.error("path collision for %s: '%s' exists as a file", f.remote_path, rel)
+            return "failed"
+
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        os.replace(partial, target)  # atomic on same volume
+        partial = None
+        fsync_dir(os.path.dirname(target))
         manifest.upsert_completed(fp, storage, f, sha, os.path.relpath(target, dest), run_id)
-        log.info("already present (identical) %s -> %s", f.remote_path, os.path.relpath(target, dest))
-        return "skipped"
+        log.info("backed up %s -> %s", f.remote_path, os.path.relpath(target, dest))
+        return "transferred"
+    except DeviceError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        # Any local filesystem / collision / hashing error: never crash the run;
+        # preserve the pulled bytes for audit when we still have them.
+        if partial is not None and os.path.exists(partial):
+            _quarantine(partial, quarantine_dir, f, id_hash)
+            partial = None
+        manifest.mark_status(fp, storage, f, "failed",
+                             f"local error: {type(exc).__name__}: {exc}", run_id)
+        log.error("local error backing up %s: %s", f.remote_path, exc)
+        return "failed"
+    finally:
+        _cleanup_dir(incoming_sub)
+        if partial is not None and os.path.exists(partial):
+            try:
+                os.remove(partial)
+            except OSError:
+                pass
 
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    os.replace(partial, target)  # atomic on same volume
-    fsync_dir(os.path.dirname(target))
-    manifest.upsert_completed(fp, storage, f, sha, os.path.relpath(target, dest), run_id)
-    log.info("backed up %s -> %s", f.remote_path, os.path.relpath(target, dest))
-    return "transferred"
+
+def ancestor_file_conflict(target: str, dest: str) -> str | None:
+    """Return the ancestor of `target` (at or above its parent, below `dest`) that
+    already exists as a non-directory and would block creating the parent chain,
+    or None. Bounded by `dest`; deterministic (pure filesystem inspection)."""
+    dest = os.path.normpath(dest)
+    chain = []
+    cur = os.path.dirname(os.path.normpath(target))
+    while True:
+        chain.append(cur)
+        parent = os.path.dirname(cur)
+        if cur == dest or cur == parent:
+            break
+        cur = parent
+    for path in reversed(chain):  # outermost ancestor first
+        if os.path.lexists(path) and not os.path.isdir(path):
+            return path
+    return None
 
 
 def resolve_target(final_default: str, id_hash: str, size: int, sha: str) -> tuple[str, str]:
@@ -1350,6 +1425,9 @@ def main(argv: list[str]) -> int:
     except PreflightError as exc:
         log.error("preflight: %s", exc)
         return EXIT_PREFLIGHT
+    except LockError as exc:
+        log.error("%s", exc)
+        return EXIT_LOCK
     except (DeviceError, InventoryError) as exc:
         log.error("%s", exc)
         return EXIT_DEVICE
