@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	mtpx "github.com/ganeshrvel/go-mtpx"
@@ -103,11 +104,155 @@ func cmdStorages(debug bool) {
 	emit(out)
 }
 
-func cmdInventory(debug bool, storageWant uint32, roots []string, includeHidden bool) {
+// walkStats records why children were kept or dropped during enumeration. It is
+// the evidence for the "GetObjectInfo silently fails per child" hypothesis: if
+// info_failed > 0 the stock proccessWalk (which just `continue`s) would have
+// silently dropped those files. `recovered` counts children rescued via the
+// object-property fallback.
+type walkStats struct {
+	Handles     int64 `json:"handles"`
+	InfoOK      int64 `json:"info_ok"`
+	InfoFailed  int64 `json:"info_failed"`
+	Recovered   int64 `json:"recovered"`
+	Unrecovered int64 `json:"unrecovered"`
+}
+
+type propU16 struct{ Value uint16 }
+
+// objectMeta fetches a child's metadata. It tries GetObjectInfo first (the path
+// stock go-mtpx uses); if that fails and doRecover is set, it falls back to
+// per-property GetObjectPropValue(ObjectFileName/ObjectFormat/ObjectSize/
+// DateModified). Returns ok=false only when the object cannot be described at
+// all (then it is dropped, exactly as stock behaviour, but now counted/logged).
+func objectMeta(dev *mtp.Device, oid uint32, st *walkStats, doRecover, debug bool,
+) (name string, size int64, isDir bool, mtime time.Time, ok bool) {
+	var obj mtp.ObjectInfo
+	if err := dev.GetObjectInfo(oid, &obj); err == nil {
+		st.InfoOK++
+		isDir = obj.ObjectFormat == mtp.OFC_Association
+		name = obj.Filename
+		mtime = obj.ModificationDate
+		if !isDir {
+			if obj.CompressedSize == 0xffffffff { // >4 GiB: real size lives in a prop
+				var v mtp.Uint64Value
+				if e := dev.GetObjectPropValue(oid, mtp.OPC_ObjectSize, &v); e == nil {
+					size = int64(v.Value)
+				}
+			} else {
+				size = int64(obj.CompressedSize)
+			}
+		}
+		return name, size, isDir, mtime, true
+	} else {
+		st.InfoFailed++
+		if debug {
+			fmt.Fprintf(os.Stderr, "mtpinv: GetObjectInfo(handle=%d) failed: %v\n", oid, err)
+		}
+		if !doRecover {
+			return "", 0, false, time.Time{}, false
+		}
+		if n, sz, dir, mt, ok2 := propFallback(dev, oid); ok2 {
+			st.Recovered++
+			if debug {
+				fmt.Fprintf(os.Stderr, "mtpinv: recovered handle=%d name=%q via properties\n", oid, n)
+			}
+			return n, sz, dir, mt, true
+		}
+		st.Unrecovered++
+		if debug {
+			fmt.Fprintf(os.Stderr, "mtpinv: property fallback failed for handle=%d\n", oid)
+		}
+		return "", 0, false, time.Time{}, false
+	}
+}
+
+func propFallback(dev *mtp.Device, oid uint32) (name string, size int64, isDir bool, mtime time.Time, ok bool) {
+	var fn mtp.StringValue
+	if err := dev.GetObjectPropValue(oid, mtp.OPC_ObjectFileName, &fn); err != nil || fn.Value == "" {
+		return "", 0, false, time.Time{}, false
+	}
+	name = fn.Value
+	var fmtv propU16
+	if err := dev.GetObjectPropValue(oid, mtp.OPC_ObjectFormat, &fmtv); err == nil {
+		isDir = fmtv.Value == mtp.OFC_Association
+	}
+	if !isDir {
+		var sz mtp.Uint64Value
+		if err := dev.GetObjectPropValue(oid, mtp.OPC_ObjectSize, &sz); err == nil {
+			size = int64(sz.Value)
+		}
+	}
+	var dm mtp.StringValue
+	if err := dev.GetObjectPropValue(oid, mtp.OPC_DateModified, &dm); err == nil {
+		mtime = parseMtpDate(dm.Value)
+	}
+	return name, size, isDir, mtime, true
+}
+
+// parseMtpDate parses the MTP DateModified string ("YYYYMMDDThhmmss[.s][Z]").
+// Returns the zero time on failure (callers format it, which is acceptable for a
+// recovered file whose GetObjectInfo already failed).
+func parseMtpDate(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}
+	}
+	core := s
+	if i := strings.IndexByte(core, '.'); i >= 0 {
+		core = core[:i]
+	}
+	core = strings.TrimSuffix(core, "Z")
+	if t, err := time.Parse("20060102T150405", core); err == nil {
+		return t
+	}
+	return time.Time{}
+}
+
+// walkDir recursively enumerates a directory by object handle, using objectMeta
+// per child. Unlike stock proccessWalk, per-child failures are counted (and
+// optionally recovered) rather than invisibly dropped.
+func walkDir(dev *mtp.Device, sid, parentId uint32, parentPath string, includeHidden bool,
+	st *walkStats, doRecover, debug bool, emitFile func(fileEntry), dirs *int64) error {
+	handles := mtp.Uint32Array{}
+	if err := dev.GetObjectHandles(sid, mtp.GOH_ALL_ASSOCS, parentId, &handles); err != nil {
+		return err
+	}
+	st.Handles += int64(len(handles.Values))
+	for _, oid := range handles.Values {
+		name, size, isDir, mtime, ok := objectMeta(dev, oid, st, doRecover, debug)
+		if !ok {
+			continue
+		}
+		if !includeHidden && strings.HasPrefix(name, ".") {
+			continue
+		}
+		full := strings.TrimRight(parentPath, "/") + "/" + name
+		if isDir {
+			*dirs++
+			if err := walkDir(dev, sid, oid, full, includeHidden, st, doRecover, debug, emitFile, dirs); err != nil {
+				if debug {
+					fmt.Fprintf(os.Stderr, "mtpinv: listing %q failed: %v\n", full, err)
+				}
+			}
+		} else {
+			emitFile(fileEntry{
+				Path:     full,
+				Name:     name,
+				Size:     size,
+				IsDir:    false,
+				MTime:    mtime.UTC().Format(time.RFC3339),
+				ObjectID: oid,
+			})
+		}
+	}
+	return nil
+}
+
+func cmdInventory(mtpDebug, debug, doRecover bool, storageWant uint32, roots []string, includeHidden bool) {
 	if len(roots) == 0 {
 		fail("inventory needs at least one root path")
 	}
-	dev := openDevice(debug)
+	dev := openDevice(mtpDebug)
 	defer mtpx.Dispose(dev)
 	sid := pickStorage(dev, storageWant)
 
@@ -121,34 +266,35 @@ func cmdInventory(debug bool, storageWant uint32, roots []string, includeHidden 
 		Files   []fileEntry `json:"files"`
 		Dirs    int64       `json:"dirs"`
 		Errors  []rootErr   `json:"errors"`
+		Stats   walkStats   `json:"stats"`
 	}{Storage: sid, Roots: roots, Files: []fileEntry{}, Errors: []rootErr{}}
 
+	st := &walkStats{}
+	emitFile := func(fe fileEntry) { out.Files = append(out.Files, fe) }
 	for _, root := range roots {
-		_, _, dirs, err := mtpx.Walk(dev, sid, root, true, false, !includeHidden,
-			func(objectId uint32, fi *mtpx.FileInfo, werr error) error {
-				if werr != nil {
-					return werr
-				}
-				// The Walk callback fires for the root itself and every descendant.
-				// Emit files only; directories are traversed but not listed.
-				if fi.IsDir {
-					return nil
-				}
-				out.Files = append(out.Files, fileEntry{
-					Path:     fi.FullPath,
-					Name:     fi.Name,
-					Size:     fi.Size,
-					IsDir:    false,
-					MTime:    fi.ModTime.UTC().Format(time.RFC3339),
-					ObjectID: fi.ObjectId,
-				})
-				return nil
-			})
+		fi, err := mtpx.GetObjectFromPath(dev, sid, root)
 		if err != nil {
 			out.Errors = append(out.Errors, rootErr{Root: root, Error: err.Error()})
 			continue
 		}
-		out.Dirs += dirs
+		if !fi.IsDir {
+			// A root that is itself a file: emit it directly.
+			if !includeHidden && strings.HasPrefix(fi.Name, ".") {
+				continue
+			}
+			emitFile(fileEntry{Path: fi.FullPath, Name: fi.Name, Size: fi.Size,
+				MTime: fi.ModTime.UTC().Format(time.RFC3339), ObjectID: fi.ObjectId})
+			continue
+		}
+		if err := walkDir(dev, sid, fi.ObjectId, strings.TrimRight(root, "/"),
+			includeHidden, st, doRecover, debug, emitFile, &out.Dirs); err != nil {
+			out.Errors = append(out.Errors, rootErr{Root: root, Error: err.Error()})
+		}
+	}
+	out.Stats = *st
+	if debug {
+		fmt.Fprintf(os.Stderr, "mtpinv: stats handles=%d info_ok=%d info_failed=%d recovered=%d unrecovered=%d\n",
+			st.Handles, st.InfoOK, st.InfoFailed, st.Recovered, st.Unrecovered)
 	}
 	emit(out)
 }
@@ -178,7 +324,10 @@ func cmdPull(debug bool, storageWant uint32, remote, destDir string) {
 }
 
 func main() {
-	debug := flag.Bool("debug", false, "enable MTP debug logging to stderr")
+	mtpDebug := flag.Bool("mtpdebug", false, "enable deep go-mtpx protocol logging to stderr")
+	debug := flag.Bool("debug", false, "log per-child GetObjectInfo failures + enumeration stats to stderr")
+	doRecover := flag.Bool("recover", false, "on GetObjectInfo failure, fall back to per-property metadata "+
+		"(GetObjectPropValue) instead of silently dropping the child")
 	storage := flag.Uint("storage", 0, "storage id (0 = first)")
 	includeHidden := flag.Bool("all", false, "include hidden files/dirs (dot-prefixed); default skips them")
 	flag.Parse()
@@ -188,14 +337,14 @@ func main() {
 	}
 	switch args[0] {
 	case "storages":
-		cmdStorages(*debug)
+		cmdStorages(*mtpDebug)
 	case "inventory":
-		cmdInventory(*debug, uint32(*storage), args[1:], *includeHidden)
+		cmdInventory(*mtpDebug, *debug, *doRecover, uint32(*storage), args[1:], *includeHidden)
 	case "pull":
 		if len(args) != 3 {
 			fail("usage: mtpinv -storage <id> pull <remotePath> <destDir>")
 		}
-		cmdPull(*debug, uint32(*storage), args[1], args[2])
+		cmdPull(*mtpDebug, uint32(*storage), args[1], args[2])
 	default:
 		fail("unknown subcommand %q", args[0])
 	}
