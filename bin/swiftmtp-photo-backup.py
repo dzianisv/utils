@@ -2,20 +2,46 @@
 """Production-safe incremental Android (MTP) photo backup using SwiftMTP's stock CLI.
 
 This tool pulls photos/videos from an MTP device (e.g. a Pixel) into a local
-destination volume, using only the read/list/pull capabilities of
-``swiftmtp-cli`` (SwiftMTP.app). It maintains an authoritative SQLite manifest so
-runs are incremental and resumable.
+destination volume. It maintains an authoritative SQLite manifest so runs are
+incremental and resumable.
+
+Transfer backend
+----------------
+By default, when the native ``mtpinv`` helper (see ``bin/mtpinv/``) is present,
+transfers go through a single persistent ``mtpinv serve`` MTP session for the
+whole run: one ``Initialize``/USB claim instead of one per file, with files
+pulled sequentially in-session and per-chunk progress streamed as NDJSON. This
+removes the per-file process/session churn of the legacy ``swiftmtp-cli pull``
+path (still used, one process + one MTP session per file, when the helper is
+absent or ``--legacy-pull`` is set). Both backends are read-only with respect to
+the device and share the SAME Python-side durability transaction below, so the
+completion criteria never depend on which backend moved the bytes. No MTP
+transfers are ever parallelised: MTP is a single-session protocol and the
+manifest is a single writer under an flock.
 
 Safety contract
 ---------------
 * Read-only with respect to the device. This script ONLY ever invokes the
-  ``devices``, ``storages``, ``ls`` and ``pull`` subcommands of swiftmtp-cli. It
-  never deletes, moves, renames, or pushes anything on the phone.
-* A file is only marked "completed" after: the CLI reported the exact
-  ``Pull complete.`` success line (its exit status is unreliable and can be 0 on
-  failure), the pulled output was discovered, its byte size matched the
-  device-reported size, its SHA-256 was computed, the bytes were fsync'd, and the
-  file was atomically renamed into place on the same volume.
+  ``devices``, ``storages``, ``ls`` and ``pull`` subcommands of swiftmtp-cli and
+  the read-only ``inventory``/``serve`` subcommands of the ``mtpinv`` helper
+  (which enumerate and read objects; they never delete, move, rename, or write to
+  the phone). Device-side deletion happens only via the separate, explicit,
+  fail-closed ``--delete-after-verify`` adb path.
+* A file is only marked "completed" after the produced bytes are staged on the
+  destination volume, their byte size matched the device-reported size, their
+  SHA-256 was computed, the bytes were fsync'd, and the file was atomically
+  renamed into place on the same volume. (On the legacy CLI path this is gated on
+  the exact ``Pull complete.`` success line, whose exit status is unreliable; on
+  the ``mtpinv serve`` path it is gated on the structured completion event plus
+  the same size/SHA/fsync/atomic-rename transaction.) A failed, stalled, or
+  partial transfer — including a mid-run MTP session loss — can NEVER be recorded
+  as completed, and a session loss never marks any later file completed.
+* Progress semantics: overall progress is byte-accurate and measured over WHOLE,
+  verified files only (``completed_bytes / (done_bytes + pending_bytes)``), so it
+  is strictly monotonic across retries/failures and its final counters equal the
+  manifest outcomes; already-backed-up bytes are counted correctly on a resumed
+  run. Current-file percent (from the helper's per-chunk progress) is shown
+  separately and never rolls the overall meter back.
 * Default mode is a dry run. Transfers only happen with ``--run``.
 * ``--dry-run`` and ``--verify`` are side-effect free with respect to production
   state: they never create the destination directory, the SQLite manifest, log
@@ -24,6 +50,7 @@ Safety contract
   is absent, exits 0 with a "nothing to verify" message and no filesystem changes.
   (An existing manifest is opened normally so verify can record its usual
   requeue/status and log output.)
+
 
 Parsing the stock ``ls`` output (known limitations)
 ---------------------------------------------------
@@ -74,12 +101,16 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import shlex
+import signal
 import sqlite3
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -109,6 +140,24 @@ EMPTY_INVENTORY_USED_FLOOR = 1 * GIB
 # read-only with respect to the device. Discovered next to this script by default.
 MTP_HELPER_DIRNAME = "mtpinv"
 DEFAULT_HELPER_TIMEOUT = 900  # seconds for a full recursive metadata walk
+
+# Per-file transfer stall (inactivity) deadline for the persistent `mtpinv serve`
+# session, in seconds. Unlike a total per-file timeout, this deadline is refreshed
+# by every progress event, so a large-but-healthy transfer is never killed while
+# bytes keep flowing; only a genuine stall (no progress for this long) aborts it.
+DEFAULT_TRANSFER_STALL = 300
+
+# Seconds to wait for the `mtpinv serve` helper to report its "ready" event after
+# spawn (one MTP Initialize/USB claim). Independent of per-file transfer time.
+DEFAULT_SERVE_READY_TIMEOUT = 120
+
+# Bound how many consecutive persistent-session losses (USB/MTP errors) we absorb
+# by reopening a fresh session before giving up on the run. Reset on any success.
+MAX_SESSION_RESTARTS = 3
+
+# Default number of most-recent runs of per-file `source_observations` to retain
+# (older runs are pruned to bound unbounded manifest growth). 0 disables pruning.
+DEFAULT_OBSERVATIONS_RETAIN = 10
 
 # Media extensions we back up (case-insensitive), per requirements.
 MEDIA_EXTS = {
@@ -178,6 +227,22 @@ class DeletionError(Exception):
     """A source-deletion precondition failed (e.g. an unmappable remote path).
 
     Raised to refuse deletion of a single file; the phone file is always kept.
+    """
+
+
+class PullFileError(Exception):
+    """A single-file pull failed at the file level (the transfer session is still
+    healthy). Recorded as a per-file failure; the run continues with the next file.
+    """
+
+
+class PullSessionError(Exception):
+    """The persistent ``mtpinv serve`` session died or stalled (USB/MTP transport
+    lost, helper exited, or no progress within the activity deadline).
+
+    Fail-closed: the current file is NOT marked completed. The driver closes the
+    (killed) helper, may reopen a fresh session, and continues from the manifest —
+    never marking any later file completed on the back of a dead session.
     """
 
 
@@ -984,10 +1049,11 @@ def _ls_walk_inventory(cli: CLI, device_id: str, storage_id: str, roots: list[st
 
 def inventory(cli: CLI, device_id: str, storage_id: str, roots: list[str],
               max_depth: int, storage_used: int | None = None,
-              helper: str | None = None
+              helper: str | None = None,
+              inventory_timeout: int = DEFAULT_HELPER_TIMEOUT
               ) -> tuple[list[MediaFile], list[tuple[str, str]]]:
     if helper is not None:
-        media, warnings = helper_inventory(helper, storage_id, roots)
+        media, warnings = helper_inventory(helper, storage_id, roots, timeout=inventory_timeout)
     else:
         media, warnings = _ls_walk_inventory(cli, device_id, storage_id, roots, max_depth)
     # Fail closed on an implausible empty inventory: the enumeration backend
@@ -1209,6 +1275,32 @@ class Manifest:
                 rows,
             )
 
+    def prune_observations(self, fp: str, storage: str, keep_runs: int) -> int:
+        """Bound ``source_observations`` growth by retaining only the most recent
+        ``keep_runs`` runs' rows for this device/storage (delete older ones).
+
+        Safe: ``source_observations`` is an append-only audit log that the
+        transfer/deletion logic never reads (imports + deletion bookkeeping are the
+        authoritative state), so pruning old observation rows cannot affect backup
+        or deletion correctness. ``keep_runs <= 0`` disables pruning (keep all).
+        Returns the number of rows deleted.
+        """
+        if keep_runs <= 0:
+            return 0
+        with self.conn:
+            cur = self.conn.execute(
+                "DELETE FROM source_observations "
+                "WHERE device_fingerprint=? AND storage_id=? AND run_id NOT IN ("
+                "  SELECT run_id FROM ("
+                "    SELECT run_id, MAX(observed_at) AS t FROM source_observations "
+                "    WHERE device_fingerprint=? AND storage_id=? "
+                "    GROUP BY run_id ORDER BY t DESC LIMIT ?"
+                "  )"
+                ")",
+                (fp, storage, fp, storage, keep_runs),
+            )
+            return cur.rowcount if cur.rowcount is not None else 0
+
     # -- imports --
     def get_import(self, fp: str, storage: str, remote_path: str, size: int, modified: str):
         return self.conn.execute(
@@ -1271,6 +1363,21 @@ class Manifest:
                 (fp, storage),
             ).fetchall()
         return self.conn.execute("SELECT * FROM imports WHERE status='completed'").fetchall()
+
+    def completed_identity_set(self, fp: str, storage: str) -> set[tuple[str, int, str]]:
+        """Return {(remote_path, size, modified)} for all completed imports on this
+        device/storage in ONE query (replaces the O(N) per-file ``is_completed``
+        round-trips in ``partition_pending``). Identity semantics are identical to
+        ``is_completed``.
+        """
+        return {
+            (row["remote_path"], row["size"], row["modified"])
+            for row in self.conn.execute(
+                "SELECT remote_path, size, modified FROM imports "
+                "WHERE status='completed' AND device_fingerprint=? AND storage_id=?",
+                (fp, storage),
+            )
+        }
 
     # -- source deletion bookkeeping --
     def rows_pending_deletion(self, fp: str, storage: str):
@@ -1589,13 +1696,398 @@ def human_bytes(n: int) -> str:
     return f"{size:.2f} TiB"
 
 
+def _fmt_eta(seconds: float | None) -> str:
+    if seconds is None or seconds < 0 or seconds != seconds:  # None / negative / NaN
+        return "--:--"
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return f"{seconds // 3600:d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+# --- Persistent MTP transfer session (mtpinv serve) --------------------------
+
+class PullSession:
+    """Drive the persistent ``mtpinv serve`` helper: ONE MTP session for a whole
+    run instead of one ``pull`` process (and one MTP Initialize/USB claim) per
+    file. Files are pulled sequentially in-session; the Python side keeps its full
+    per-file safety transaction (expected size, SHA-256, fsync, atomic publish,
+    manifest commit) — the helper only moves bytes.
+
+    Isolation & cancellation: the helper runs in its OWN process group
+    (``start_new_session=True``) so a stall is resolved by killing exactly that
+    process tree (``killpg``), never anything else. A background reader thread
+    turns the helper's NDJSON stdout into a queue the driver consumes with a
+    per-file activity deadline; each progress event refreshes the deadline so a
+    large healthy transfer is never killed mid-flight.
+    """
+
+    def __init__(self, helper_path: str, storage_id: str, debug: bool = False):
+        self.helper_path = helper_path
+        self.storage_id = str(storage_id)
+        self.debug = debug
+        self.proc: subprocess.Popen | None = None
+        self._q: "queue.Queue[dict | None]" = queue.Queue()
+        self._reader: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._stderr_tail: list[str] = []
+        self._dead = False
+
+    def start(self, ready_timeout: int = DEFAULT_SERVE_READY_TIMEOUT) -> None:
+        # Flags MUST precede the subcommand (Go stdlib flag stops at the first
+        # non-flag token); mirror helper_inventory's ordering.
+        cmd = [self.helper_path, "-storage", self.storage_id]
+        if self.debug:
+            cmd.append("-debug")
+        cmd.append("serve")
+        log.debug("exec serve helper: %s", " ".join(cmd))
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                errors="replace", bufsize=1, start_new_session=True,
+            )
+        except OSError as exc:
+            raise DeviceError(f"could not start mtp transfer helper {self.helper_path}: {exc}")
+        self._reader = threading.Thread(target=self._read_stdout, daemon=True)
+        self._reader.start()
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
+        # Await the one-time "ready" event (covers the MTP Initialize/USB claim).
+        ev = self._next_event(ready_timeout)
+        if ev is None or ev == "__timeout__":
+            self._terminate()
+            raise DeviceError(
+                "mtp transfer helper did not become ready (device busy/disconnected?): "
+                + self._stderr_summary())
+        if ev.get("type") != "ready":
+            self._terminate()
+            raise DeviceError(f"unexpected first event from mtp transfer helper: {ev!r}")
+        log.debug("mtp transfer session ready (storage=%s, pid=%s)",
+                  ev.get("storage"), ev.get("pid"))
+
+    def _read_stdout(self) -> None:
+        assert self.proc is not None and self.proc.stdout is not None
+        try:
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    self._q.put(json.loads(line))
+                except json.JSONDecodeError:
+                    log.debug("ignoring non-JSON serve line: %r", line[:200])
+        finally:
+            self._q.put(None)  # EOF sentinel
+
+    def _read_stderr(self) -> None:
+        assert self.proc is not None and self.proc.stderr is not None
+        for line in self.proc.stderr:
+            line = line.rstrip("\n")
+            if line:
+                self._stderr_tail.append(_redact(line))
+                if len(self._stderr_tail) > 20:
+                    self._stderr_tail.pop(0)
+
+    def _stderr_summary(self) -> str:
+        return "; ".join(self._stderr_tail[-3:]) if self._stderr_tail else "(no stderr)"
+
+    def _next_event(self, timeout: float) -> dict | None:
+        try:
+            return self._q.get(timeout=timeout)
+        except queue.Empty:
+            return "__timeout__"  # sentinel distinct from EOF (None)
+
+    def pull(self, remote: str, dest: str, stall_timeout: int,
+             progress_cb=None) -> dict:
+        """Pull one object into ``dest`` within the live session.
+
+        Returns the ``complete`` event dict. Raises ``PullFileError`` for a
+        file-level failure (session still healthy) and ``PullSessionError`` if the
+        session died, stalled, or exited (fail-closed: caller must not mark the
+        file completed).
+        """
+        if self._dead or self.proc is None or self.proc.stdin is None:
+            raise PullSessionError("transfer session is not running")
+        req = json.dumps({"cmd": "pull", "remote": remote, "dest": dest}) + "\n"
+        try:
+            self.proc.stdin.write(req)
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            self._dead = True
+            raise PullSessionError(f"transfer session write failed: {exc}")
+
+        deadline = stall_timeout if stall_timeout > 0 else DEFAULT_TRANSFER_STALL
+        while True:
+            ev = self._next_event(deadline)
+            if ev == "__timeout__":
+                self._terminate()
+                raise PullSessionError(
+                    f"transfer stalled: no progress for {deadline}s on {os.path.basename(remote)}")
+            if ev is None:  # EOF: helper exited
+                self._dead = True
+                raise PullSessionError("transfer session ended: " + self._stderr_summary())
+            etype = ev.get("type")
+            if etype == "progress":
+                if progress_cb is not None:
+                    try:
+                        progress_cb(int(ev.get("sent") or 0), int(ev.get("total") or 0))
+                    except Exception:  # progress rendering must never break a transfer
+                        pass
+                continue
+            if etype == "complete":
+                # Defensive: the completion must be for the file we asked for.
+                if ev.get("remote") not in (None, remote):
+                    raise PullSessionError(
+                        f"session desync: completion for {ev.get('remote')!r}, expected {remote!r}")
+                return ev
+            if etype == "error":
+                if ev.get("fatal"):
+                    self._dead = True
+                    raise PullSessionError(f"session error: {ev.get('error')}")
+                raise PullFileError(str(ev.get("error") or "pull failed"))
+            # Ignore anything else (e.g. a stray pong) and keep waiting.
+
+    def _terminate(self) -> None:
+        """Kill ONLY the helper's own process tree (its process group)."""
+        self._dead = True
+        if self.proc is None:
+            return
+        proc = self.proc
+        try:
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+        finally:
+            try:
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+    def close(self) -> None:
+        """Politely ask the helper to quit; force-kill its tree if it lingers."""
+        if self.proc is None:
+            return
+        proc = self.proc
+        if not self._dead and proc.poll() is None and proc.stdin is not None:
+            try:
+                proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+                proc.stdin.flush()
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                self._terminate()
+        else:
+            self._terminate()
+        self.proc = None
+
+
+# --- Progress reporting ------------------------------------------------------
+
+class ProgressReporter:
+    """Byte-accurate, monotonic backup progress for both TTY and log sinks.
+
+    Overall progress is measured in WHOLE, verified files only:
+    ``completed_bytes / total_bytes`` where ``total_bytes = done_bytes +
+    pending_bytes`` (the full library for this device/storage) and
+    ``completed_bytes`` starts at ``done_bytes`` (already-backed-up bytes counted
+    correctly on a resumed run) and grows only when a file is fully transferred or
+    confirmed byte-identical. A failed/stalled/partial file adds nothing, so the
+    overall meter is strictly monotonic across retries and failures; the final
+    counters equal the manifest outcomes. Current-file percent (from the helper's
+    per-chunk progress) is shown separately and never rolls the overall meter back.
+
+    Rendering:
+      * TTY (stderr.isatty()): one in-place line updated with ``\\r``, throttled to
+        ~5 Hz, finished with a newline.
+      * Non-TTY: throttled, newline-terminated, timestamped lines (every +5% of
+        overall bytes or every 30 s), never carriage returns or ANSI.
+    All text is routed through ``_redact`` so a serial can never leak.
+    """
+
+    def __init__(self, done_bytes: int, pending_bytes: int,
+                 done_files: int, pending_files: int):
+        self.total_bytes = done_bytes + pending_bytes
+        self.pending_bytes = pending_bytes
+        self.completed_bytes = done_bytes
+        self.done_files = done_files
+        self.pending_files = pending_files
+        self.remaining_bytes = pending_bytes
+        self.transferred = self.skipped = self.failed = 0
+        self.deleted = self.delete_failed = 0
+        # current file
+        self.cur_index = 0
+        self.cur_name = ""
+        self.cur_size = 0
+        self.cur_sent = 0
+        # throughput / cadence
+        self._start = time.monotonic()
+        self._moved_bytes = 0            # bytes actually pulled over USB this run
+        self._rate_ema: float | None = None
+        self._last_sample_t = self._start
+        self._last_sample_moved = 0
+        self._last_render = 0.0
+        self._last_log_pct = -100.0
+        self._last_log_t = self._start
+        self._isatty = sys.stderr.isatty()
+        self._active = False
+        self._closed = False
+
+    # -- lifecycle --
+    def start_file(self, index: int, name: str, size: int) -> None:
+        self.cur_index = index
+        self.cur_name = name
+        self.cur_size = size
+        self.cur_sent = 0
+        self._active = True
+        self._render()
+
+    def file_progress(self, sent: int, total: int) -> None:
+        if sent < self.cur_sent:  # never let a restarted chunk count move backward
+            return
+        delta = sent - self.cur_sent
+        self.cur_sent = sent
+        if total > 0:
+            self.cur_size = total
+        self._moved_bytes += max(0, delta)
+        self._sample_rate()
+        self._render()
+
+    def finish_file(self, outcome: str, size: int) -> None:
+        self.remaining_bytes = max(0, self.remaining_bytes - size)
+        if outcome in ("transferred", "skipped"):
+            self.completed_bytes += size
+            if outcome == "transferred":
+                self.transferred += 1
+            else:
+                self.skipped += 1
+        else:
+            self.failed += 1
+        self.cur_sent = 0
+        self._sample_rate()
+        self._render(force=True)
+
+    def set_deletions(self, deleted: int, delete_failed: int) -> None:
+        self.deleted = deleted
+        self.delete_failed = delete_failed
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._active = False
+        if self._isatty:
+            try:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+            except (OSError, ValueError):
+                pass
+        else:
+            # One final, unthrottled summary line for logs.
+            self._render(final=True)
+
+    # -- internals --
+    def _sample_rate(self) -> None:
+        now = time.monotonic()
+        dt = now - self._last_sample_t
+        if dt < 0.5:
+            return
+        dmoved = self._moved_bytes - self._last_sample_moved
+        if dmoved > 0:
+            inst = dmoved / dt
+            self._rate_ema = inst if self._rate_ema is None else 0.3 * inst + 0.7 * self._rate_ema
+        self._last_sample_t = now
+        self._last_sample_moved = self._moved_bytes
+
+    def _rate(self) -> float | None:
+        if self._rate_ema and self._rate_ema > 0:
+            return self._rate_ema
+        elapsed = time.monotonic() - self._start
+        if self._moved_bytes > 0 and elapsed > 0:
+            return self._moved_bytes / elapsed
+        return None
+
+    def _overall_pct(self) -> float:
+        if self.total_bytes <= 0:
+            return 100.0
+        return min(100.0, self.completed_bytes / self.total_bytes * 100.0)
+
+    def _eta(self) -> float | None:
+        rate = self._rate()
+        if not rate:
+            return None
+        remaining = max(0, self.remaining_bytes - self.cur_sent)
+        return remaining / rate
+
+    def _line(self) -> str:
+        pct = self._overall_pct()
+        rate = self._rate()
+        rate_s = f"{rate / (1024 * 1024):.1f} MiB/s" if rate else "-- MiB/s"
+        cur = ""
+        if self._active and self.cur_name:
+            fpct = (self.cur_sent / self.cur_size * 100.0) if self.cur_size > 0 else 100.0
+            cur = (f" | [{self.cur_index}/{self.pending_files}] {self.cur_name} "
+                   f"{min(100.0, fpct):.0f}%")
+        dels = ""
+        if self.deleted or self.delete_failed:
+            dels = f" del {self.deleted} delfail {self.delete_failed}"
+        return (f"{pct:.1f}% | {human_bytes(self.completed_bytes)}/{human_bytes(self.total_bytes)}"
+                f" | {rate_s} | ETA {_fmt_eta(self._eta())}{cur}"
+                f" | ok {self.transferred} skip {self.skipped} fail {self.failed}{dels}")
+
+    def _render(self, force: bool = False, final: bool = False) -> None:
+        now = time.monotonic()
+        line = _redact(self._line())
+        if self._isatty:
+            # `force` only bypasses the cheap in-place rate limit; the line is
+            # rewritten in place so frequent updates never flood.
+            if not force and (now - self._last_render) < 0.2:
+                return
+            self._last_render = now
+            try:
+                sys.stderr.write("\r\x1b[2K" + line)
+                sys.stderr.flush()
+            except (OSError, ValueError):
+                pass
+            # Coarse structured trace to the JSONL file log (never floods console).
+            log.debug("progress %s", line)
+            return
+        # Non-TTY: emit ONLY on meaningful thresholds (or the final line) so logs
+        # stay readable regardless of file count. `force` must NOT bypass this —
+        # otherwise a per-file force would flood a cron/launchd log.
+        pct = self._overall_pct()
+        if not final and (pct - self._last_log_pct) < 5.0 and (now - self._last_log_t) < 30.0:
+            return
+        self._last_log_pct = pct
+        self._last_log_t = now
+        try:
+            sys.stderr.write(f"{now_iso()} progress {line}\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+        log.debug("progress %s", line)
+
+
 # --- Modes -------------------------------------------------------------------
 
 def partition_pending(manifest: Manifest, fp: str, storage: str,
                       files: list[MediaFile]) -> tuple[list[MediaFile], int, int]:
+    # One bulk query for the whole completed identity set (was O(N) per-file
+    # SELECTs). Identity semantics are unchanged: a file counts as already backed
+    # up iff (remote_path, size, modified) matches a row with status='completed'
+    # for this device fingerprint + storage.
+    completed = manifest.completed_identity_set(fp, storage)
     pending, done_bytes, pending_bytes = [], 0, 0
     for f in files:
-        if manifest.is_completed(fp, storage, f.remote_path, f.size, f.modified):
+        if (f.remote_path, f.size, f.modified) in completed:
             done_bytes += f.size
         else:
             pending.append(f)
@@ -1634,10 +2126,12 @@ def load_completed_map(db_path: str, fp: str, storage: str) -> dict:
 def do_dry_run(cli: CLI, dest: str, mount: str, device_id: str, model: str,
                fp: str, storage: str, roots: list[str], max_depth: int,
                min_free_gib: float, completed: dict,
-               storage_used: int | None = None, helper: str | None = None) -> int:
+               storage_used: int | None = None, helper: str | None = None,
+               inventory_timeout: int = DEFAULT_HELPER_TIMEOUT) -> int:
     """Preview only. Reads the device and an EXISTING manifest; writes nothing and
     never creates the destination, manifest, logs, or lock."""
-    files, warnings = inventory(cli, device_id, storage, roots, max_depth, storage_used, helper)
+    files, warnings = inventory(cli, device_id, storage, roots, max_depth,
+                                storage_used, helper, inventory_timeout)
     device_dir = f"{sanitize_component(model)}-{fp}"
     pending, done_bytes, pending_bytes = [], 0, 0
     for f in files:
@@ -1758,16 +2252,25 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
            min_free_gib: float, pull_timeout: int,
            storage_used: int | None = None, helper: str | None = None,
            adb: "Adb | None" = None, android_root: str = "/sdcard",
-           delete_after_verify: bool = False) -> int:
+           delete_after_verify: bool = False,
+           inventory_timeout: int = DEFAULT_HELPER_TIMEOUT,
+           transfer_timeout: int = 0, observations_retain: int = DEFAULT_OBSERVATIONS_RETAIN,
+           legacy_pull: bool = False, verbose: bool = False) -> int:
     run_id = manifest.start_run("run", fp, storage, dest)
     incoming_dir = os.path.join(dest, BACKUP_DIRNAME, "incoming", run_id)
     quarantine_dir = os.path.join(dest, BACKUP_DIRNAME, "quarantine", run_id)
     os.makedirs(incoming_dir, exist_ok=True)
     device_dir = f"{sanitize_component(model)}-{fp}"
     transferred = failed = skipped = 0
+    session: PullSession | None = None
+    reporter: ProgressReporter | None = None
     try:
-        files, warnings = inventory(cli, device_id, storage, roots, max_depth, storage_used, helper)
+        files, warnings = inventory(cli, device_id, storage, roots, max_depth,
+                                    storage_used, helper, inventory_timeout)
         manifest.record_observations(run_id, fp, storage, files)
+        pruned = manifest.prune_observations(fp, storage, observations_retain)
+        if pruned:
+            log.debug("pruned %d old source_observations row(s)", pruned)
         reconcile(manifest, dest, fp, storage)
         pending, done_bytes, pending_bytes = partition_pending(manifest, fp, storage, files)
 
@@ -1781,42 +2284,112 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
             log.error(msg)
             return EXIT_SPACE
 
-        log.info("run: %d pending file(s), %s", len(pending), human_bytes(pending_bytes))
+        # Prefer the one-session `mtpinv serve` transfer path (one MTP Initialize
+        # for the whole run) when the native helper is available. Fall back to the
+        # legacy per-file `swiftmtp-cli pull` (one process + one MTP session per
+        # file) only when there is no helper or --legacy-pull is set.
+        use_session = helper is not None and not legacy_pull
+        cli_pull = make_cli_pull(cli, device_id, storage, pull_timeout)
+        session_pull = make_session_pull(lambda: session, transfer_timeout)
+        log.info("run: %d pending file(s), %s, transfer backend: %s", len(pending),
+                 human_bytes(pending_bytes), "mtpinv serve (single session)" if use_session
+                 else "swiftmtp-cli pull (per-file)")
+
+        done_files = len(files) - len(pending)
+        reporter = ProgressReporter(done_bytes, pending_bytes, done_files, len(pending))
+        session_restarts = 0
+        aborted = False
         for i, f in enumerate(pending, 1):
-            log.info("[%d/%d] %s (%s)", i, len(pending), f.remote_path, human_bytes(f.size))
+            log.debug("[%d/%d] %s (%s)", i, len(pending), f.remote_path, human_bytes(f.size))
+            reporter.start_file(i, os.path.basename(f.remote_path), f.size)
+            if use_session and session is None:
+                try:
+                    session = PullSession(helper, storage, debug=verbose)
+                    session.start()
+                except DeviceError as exc:
+                    manifest.mark_status(fp, storage, f, "failed",
+                                         f"transfer session open failed: {exc}", run_id)
+                    failed += 1
+                    reporter.finish_file("failed", f.size)
+                    log.error("cannot open MTP transfer session; aborting remaining transfers: %s", exc)
+                    aborted = True
+                    break
+            pull_fn = session_pull if use_session else cli_pull
+            progress_cb = reporter.file_progress if use_session else None
             try:
-                result = transfer_one(cli, manifest, dest, device_id, device_dir, fp, storage, f,
-                                      incoming_dir, quarantine_dir, run_id, pull_timeout)
+                result = transfer_one(pull_fn, manifest, dest, device_dir, fp, storage, f,
+                                      incoming_dir, quarantine_dir, run_id, progress_cb)
             except DeviceError:
                 manifest.mark_status(fp, storage, f, "failed", "device connection lost", run_id)
                 failed += 1
+                reporter.finish_file("failed", f.size)
                 log.error("device connection lost; aborting remaining transfers")
+                aborted = True
                 break
+            except PullSessionError as exc:
+                # Session died/stalled: this file is NOT completed (fail closed).
+                # Close the (already-killed) helper, then reopen a fresh session on
+                # the next file and continue from the manifest — no per-file churn.
+                manifest.mark_status(fp, storage, f, "failed", f"transfer session lost: {exc}", run_id)
+                failed += 1
+                reporter.finish_file("failed", f.size)
+                try:
+                    if session is not None:
+                        session.close()
+                finally:
+                    session = None
+                session_restarts += 1
+                if session_restarts > MAX_SESSION_RESTARTS:
+                    log.error("too many MTP transfer-session losses (%d); aborting run: %s",
+                              session_restarts, exc)
+                    aborted = True
+                    break
+                log.error("MTP transfer session lost (%s); reopening (restart %d/%d)",
+                          exc, session_restarts, MAX_SESSION_RESTARTS)
+                continue
             except (OSError, RuntimeError, ValueError) as exc:
                 # Local filesystem / collision / hashing / path-containment error for
                 # THIS file: record and keep going rather than aborting with a traceback.
                 manifest.mark_status(fp, storage, f, "failed",
                                      f"local error: {type(exc).__name__}: {exc}", run_id)
                 failed += 1
+                reporter.finish_file("failed", f.size)
                 log.error("local error backing up %s: %s", f.remote_path, exc)
                 continue
             if result == "transferred":
                 transferred += 1
+                session_restarts = 0  # a good transfer clears the restart budget
+                reporter.finish_file("transferred", f.size)
             elif result == "skipped":
                 skipped += 1
+                session_restarts = 0
+                reporter.finish_file("skipped", f.size)
             else:
                 failed += 1
+                reporter.finish_file("failed", f.size)
+
+        # Close the transfer session before the deletion pass (deletion is adb, not
+        # MTP, but we release the USB claim promptly and deterministically).
+        if session is not None:
+            session.close()
+            session = None
 
         # Source-deletion pass (only when explicitly armed). Runs AFTER transfers
         # and BEFORE finish_run so it covers both the rows already completed on a
         # prior run AND files transferred earlier in THIS run: upsert_completed
         # commits per file, and reconcile guarantees every still-'completed' row
         # has a present, correct-size local copy. Each file is independently
-        # re-verified inside delete_source_for_row before its one `rm --`.
+        # re-verified inside delete_source_for_row before its one `rm --`. Skipped
+        # when the transfer stage aborted (device/session gone) so we never chase a
+        # disconnected device.
         deleted = delete_failed = already_absent = 0
-        if delete_after_verify and adb is not None:
+        if delete_after_verify and adb is not None and not aborted:
             deleted, delete_failed, already_absent = run_deletion_pass(
                 adb, manifest, dest, fp, storage, android_root, run_id)
+
+        reporter.set_deletions(deleted, delete_failed)
+        reporter.close()
+        reporter = None
 
         run_failed = failed > 0 or delete_failed > 0
         status = "ok" if not run_failed else "partial"
@@ -1835,41 +2408,80 @@ def do_run(manifest: Manifest, cli: CLI, dest: str, device_id: str, model: str,
         manifest.finish_run(run_id, "error", str(exc))
         raise
     finally:
+        if reporter is not None:
+            reporter.close()
+        if session is not None:
+            session.close()
         # Always remove this run's incoming staging area (any leftover .partial
         # files or per-file subdirs), even on early return or exception.
         _cleanup_dir(incoming_dir)
 
 
-def transfer_one(cli: CLI, manifest: Manifest, dest: str, device_id: str, device_dir: str,
+def make_cli_pull(cli: CLI, device_id: str, storage: str, pull_timeout: int):
+    """Legacy per-file pull via ``swiftmtp-cli`` (one process + one MTP session per
+    file). Used only when the native ``mtpinv`` helper is unavailable or
+    ``--legacy-pull`` is set. Returns ``(produced_path|None, error|None)``.
+    """
+    def _pull(f: MediaFile, incoming_sub: str, progress_cb):
+        timeout = pull_timeout if pull_timeout > 0 else max(600, int(f.size / (150 * 1024)) + 600)
+        rc, out, _err = cli.run("pull", [device_id, storage, f.remote_path, incoming_sub], timeout)
+        if rc != 0 or not pull_reported_success(out):
+            return None, f"pull did not report success (rc={rc})"
+        produced = discover_pulled_file(incoming_sub, os.path.basename(f.remote_path))
+        if produced is None:
+            return None, "pulled output not found"
+        return produced, None
+    return _pull
+
+
+def make_session_pull(get_session, transfer_timeout: int):
+    """Pull via the persistent ``mtpinv serve`` session (one MTP session for the
+    whole run). ``get_session`` returns the current live PullSession. File-level
+    failures become ``(None, error)``; a session death/stall raises
+    ``PullSessionError`` (fail-closed) for the caller to reopen and continue.
+    Returns ``(produced_path|None, error|None)``.
+    """
+    def _pull(f: MediaFile, incoming_sub: str, progress_cb):
+        dest_file = os.path.join(incoming_sub, "payload.bin")
+        try:
+            get_session().pull(f.remote_path, dest_file, transfer_timeout, progress_cb)
+        except PullFileError as exc:
+            return None, str(exc)
+        return dest_file, None
+    return _pull
+
+
+def transfer_one(pull_fn, manifest: Manifest, dest: str, device_dir: str,
                  fp: str, storage: str, f: MediaFile, incoming_dir: str, quarantine_dir: str,
-                 run_id: str, pull_timeout: int) -> str:
-    """Pull one file and place it atomically. Raises only DeviceError; all local
-    filesystem/collision errors are converted to a recorded failed/quarantined
-    status (returns "failed"), and the per-file incoming staging is always cleaned.
+                 run_id: str, progress_cb=None) -> str:
+    """Pull one file (via ``pull_fn``) and place it atomically. Re-raises
+    DeviceError and PullSessionError (transport-level, handled by the run loop);
+    all local filesystem/collision errors are converted to a recorded
+    failed/quarantined status (returns "failed"), and the per-file incoming
+    staging is always cleaned.
+
+    The durability/verification transaction is identical regardless of pull
+    backend: stage on the same volume, check the size against the device-reported
+    size, SHA-256, fsync, atomically publish, then commit the manifest row. A file
+    is marked completed ONLY after all of these succeed, so a failed or partial
+    transfer can never be recorded as complete.
     """
     identity = f"{fp}|{storage}|{f.remote_path}|{f.size}|{f.modified}"
     id_hash = hashlib.sha256(identity.encode()).hexdigest()[:8]
 
     incoming_sub = os.path.join(incoming_dir, uuid.uuid4().hex)
     os.makedirs(incoming_sub, exist_ok=True)
-    timeout = pull_timeout if pull_timeout > 0 else max(600, int(f.size / (150 * 1024)) + 600)
     partial: str | None = None
     try:
         # Computed inside the guarded block: build_final_path raises ValueError if
         # the sanitized/realpath'd destination would escape DEST (e.g. via a symlink
         # ancestor). That must fail just this file, not abort the whole run.
         final_default = build_final_path(dest, device_dir, storage, f.remote_path)
-        rc, out, _err = cli.run("pull", [device_id, storage, f.remote_path, incoming_sub], timeout)
-        if rc != 0 or not pull_reported_success(out):
-            manifest.mark_status(fp, storage, f, "failed",
-                                 f"pull did not report success (rc={rc})", run_id)
-            log.error("pull failed for %s", f.remote_path)
-            return "failed"
-
-        produced = discover_pulled_file(incoming_sub, os.path.basename(f.remote_path))
+        produced, pull_err = pull_fn(f, incoming_sub, progress_cb)
         if produced is None:
-            manifest.mark_status(fp, storage, f, "failed", "pulled output not found", run_id)
-            log.error("pulled output not discovered for %s", f.remote_path)
+            manifest.mark_status(fp, storage, f, "failed",
+                                 pull_err or "pull did not report success", run_id)
+            log.error("pull failed for %s: %s", f.remote_path, pull_err)
             return "failed"
 
         # Move to a unique .partial on the same volume before verifying.
@@ -1894,7 +2506,7 @@ def transfer_one(cli: CLI, manifest: Manifest, dest: str, device_id: str, device
             os.remove(partial)
             partial = None
             manifest.upsert_completed(fp, storage, f, sha, os.path.relpath(target, dest), run_id)
-            log.info("already present (identical) %s -> %s", f.remote_path, os.path.relpath(target, dest))
+            log.debug("already present (identical) %s -> %s", f.remote_path, os.path.relpath(target, dest))
             return "skipped"
 
         # Deterministic handling of sanitized file-vs-directory collisions: if an
@@ -1919,9 +2531,9 @@ def transfer_one(cli: CLI, manifest: Manifest, dest: str, device_id: str, device
         partial = None
         fsync_dir(os.path.dirname(target))
         manifest.upsert_completed(fp, storage, f, sha, os.path.relpath(target, dest), run_id)
-        log.info("backed up %s -> %s", f.remote_path, os.path.relpath(target, dest))
+        log.debug("backed up %s -> %s", f.remote_path, os.path.relpath(target, dest))
         return "transferred"
-    except DeviceError:
+    except (DeviceError, PullSessionError):
         raise
     except (OSError, RuntimeError, ValueError) as exc:
         # Any local filesystem / collision / hashing / path-containment error:
@@ -2102,8 +2714,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-depth", type=int, default=40, help="max recursion depth (default: 40)")
     p.add_argument("--list-timeout", type=int, default=180,
                    help="timeout (s) for devices/storages/ls (default: 180)")
+    p.add_argument("--inventory-timeout", type=int, default=DEFAULT_HELPER_TIMEOUT,
+                   help=f"timeout (s) for the native mtpinv recursive metadata walk "
+                        f"(default: {DEFAULT_HELPER_TIMEOUT}). Raise this for very large "
+                        f"libraries so a slow-but-healthy walk is not aborted.")
     p.add_argument("--pull-timeout", type=int, default=0,
-                   help="timeout (s) per pull; 0 = auto by size (default: 0)")
+                   help="LEGACY per-file pull path only: total timeout (s) per swiftmtp-cli "
+                        "pull; 0 = auto by size (default: 0)")
+    p.add_argument("--transfer-timeout", type=int, default=0,
+                   help=f"persistent-session path only: per-file INACTIVITY deadline (s) — the "
+                        f"transfer is aborted only if no progress arrives for this long, so a "
+                        f"large healthy transfer is never killed while bytes keep flowing. "
+                        f"0 = auto ({DEFAULT_TRANSFER_STALL}s).")
+    p.add_argument("--observations-retain", type=int, default=DEFAULT_OBSERVATIONS_RETAIN,
+                   help=f"retain only the most recent N runs of the per-file source_observations "
+                        f"audit log (older rows are pruned to bound manifest growth; the "
+                        f"transfer/deletion logic never reads this table). 0 = keep all "
+                        f"(default: {DEFAULT_OBSERVATIONS_RETAIN}).")
+    p.add_argument("--legacy-pull", action="store_true",
+                   help="force the legacy per-file `swiftmtp-cli pull` transfer path even when the "
+                        "native mtpinv helper is available (debug/fallback). The default is the "
+                        "faster single-session `mtpinv serve` path when the helper is present.")
     p.add_argument("--allow-unmounted-dest", action="store_true",
                    help="TEST ONLY: skip the real-volume mount-point check (does not weaken "
                         "writability/containment checks)")
@@ -2232,13 +2863,17 @@ def main(argv: list[str]) -> int:
                           roots, args.max_depth, args.min_free_gib, args.pull_timeout,
                           guard_used, helper,
                           adb=adb, android_root=args.android_root,
-                          delete_after_verify=args.delete_after_verify)
+                          delete_after_verify=args.delete_after_verify,
+                          inventory_timeout=args.inventory_timeout,
+                          transfer_timeout=args.transfer_timeout,
+                          observations_retain=args.observations_retain,
+                          legacy_pull=args.legacy_pull, verbose=args.verbose)
 
         # dry-run: read-only preview; creates no destination/manifest/logs/lock.
         completed = load_completed_map(db_path, fp, storage)
         return do_dry_run(cli, dest, mount, device_id, model, fp, storage,
                           roots, args.max_depth, args.min_free_gib, completed,
-                          guard_used, helper)
+                          guard_used, helper, args.inventory_timeout)
 
     except PreflightError as exc:
         log.error("preflight: %s", exc)
