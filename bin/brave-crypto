@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+#
+# brave-crypto — launch Brave through Tor, exiting OUTSIDE jurisdictions that
+# regulate/restrict crypto (US, UK, sanctioned states, …), so DeFi and crypto
+# apps don't geoblock you.
+#
+# It will:
+#   1. install Tor if it's missing (Homebrew on macOS, apt-get on Debian/Ubuntu)
+#   2. write a dedicated Tor config that excludes regulated-crypto exit regions
+#   3. start that Tor instance if it isn't already running, and wait until ready
+#   4. launch Brave (isolated ~/.defi profile) pointed at Tor's SOCKS proxy
+#   5. detach Brave to the background and exit
+#
+set -euo pipefail
+
+# --- config ----------------------------------------------------------------
+SOCKS_PORT=9250                       # dedicated port (avoids clashing w/ 9050)
+BRAVE_PROFILE="$HOME/.config/brave-crypto"
+
+# Exit countries to AVOID — regulated / restricted / sanctioned crypto regimes.
+# Tor will never exit through these (StrictNodes makes it a hard rule). Edit
+# freely; plenty of crypto-friendly exits remain (DE, NL, FR, CH, LU, FI, …).
+#   us United States   gb United Kingdom  ca Canada      cn China
+#   ru Russia          by Belarus         ir Iran        kp North Korea
+#   sy Syria           cu Cuba            ve Venezuela
+EXCLUDE_COUNTRIES="us gb ca cn ru by ir kp sy cu ve"
+
+BASE="$HOME/.local/share/brave-crypto"
+TORRC="$BASE/torrc"
+DATA_DIR="$BASE/tor-data"
+LOG="$BASE/tor.log"
+
+# --- helpers ---------------------------------------------------------------
+log() { printf 'brave-crypto: %s\n' "$*" >&2; }
+die() { printf 'brave-crypto: error: %s\n' "$*" >&2; exit 1; }
+
+# Is something already listening on 127.0.0.1:$1 ?
+port_open() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3>&-; return 0; }
+    return 1
+  fi
+}
+
+install_tor() {
+  command -v tor >/dev/null 2>&1 && return 0
+  log "tor not found; installing…"
+  if command -v brew >/dev/null 2>&1; then
+    brew install tor
+  elif command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update && sudo apt-get install -y tor
+  else
+    die "no supported package manager (brew/apt-get); install tor manually."
+  fi
+}
+
+find_brave() {
+  local c
+  for c in \
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
+    "$(command -v brave-browser 2>/dev/null || true)" \
+    "$(command -v brave-browser-stable 2>/dev/null || true)" \
+    "$(command -v brave 2>/dev/null || true)"; do
+    [ -n "$c" ] && [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+write_torrc() {
+  mkdir -p "$BASE" "$DATA_DIR"
+  chmod 700 "$DATA_DIR"
+  local excl="" cc
+  for cc in $EXCLUDE_COUNTRIES; do excl="${excl:+$excl,}{$cc}"; done
+  cat > "$TORRC" <<EOF
+SocksPort 127.0.0.1:${SOCKS_PORT}
+DataDirectory ${DATA_DIR}
+# Never exit through a regulated/sanctioned crypto jurisdiction.
+# StrictNodes 1 = fail closed: refuse a circuit rather than break the rule.
+ExcludeExitNodes ${excl}
+StrictNodes 1
+Log notice file ${LOG}
+EOF
+}
+
+start_tor() {
+  if port_open "$SOCKS_PORT"; then
+    log "tor already running on 127.0.0.1:${SOCKS_PORT}"
+    return 0
+  fi
+  write_torrc
+  : > "$LOG"
+  log "starting tor (SOCKS 127.0.0.1:${SOCKS_PORT}; excluding: ${EXCLUDE_COUNTRIES})"
+  nohup tor -f "$TORRC" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  local i
+  for i in $(seq 1 60); do                      # wait up to ~120s for bootstrap
+    grep -q "Bootstrapped 100%" "$LOG" 2>/dev/null && { log "tor ready."; return 0; }
+    if grep -qi "\[err\]" "$LOG" 2>/dev/null; then
+      grep -i "\[err\]" "$LOG" | tail -2 >&2
+      die "tor failed to start (see $LOG)."
+    fi
+    sleep 2
+  done
+  log "warning: tor still bootstrapping; Brave may need a few seconds to connect."
+}
+
+# --- main ------------------------------------------------------------------
+install_tor
+start_tor
+
+# Best-effort: report the exit country so you can see it worked.
+if command -v curl >/dev/null 2>&1; then
+  cc="$(curl -s --max-time 20 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
+        https://ifconfig.co/country-iso 2>/dev/null | tr -d '\n' || true)"
+  [ -n "${cc:-}" ] && log "exit country: ${cc}"
+fi
+
+BRAVE="$(find_brave)" || die "Brave not found. Install Brave Browser first."
+mkdir -p "$BRAVE_PROFILE"
+log "launching Brave (profile ${BRAVE_PROFILE}) via socks5://127.0.0.1:${SOCKS_PORT}"
+nohup "$BRAVE" \
+  --user-data-dir="$BRAVE_PROFILE" \
+  --proxy-server="socks5://127.0.0.1:${SOCKS_PORT}" \
+  >/dev/null 2>&1 &
+disown 2>/dev/null || true
+
+log "done — Brave is running in the background; this script is exiting."
+exit 0
