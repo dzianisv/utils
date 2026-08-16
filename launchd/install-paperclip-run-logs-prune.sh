@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Installs paperclip-run-logs-prune as a daily LaunchAgent (runs at 04:00 local time).
+# Installs paperclip-run-logs-prune as an hourly LaunchAgent.
 # Re-running is idempotent — unloads before replacing.
+#
+# AGE-312 stage-3: the original daily-at-04:00 cadence let real ENOSPC recur
+# within ~13h of a fresh cleanup (fleet-wide npm/pnpm/worktree churn refills
+# the disk far faster than once a day). Hourly + 1-day retention keeps the
+# host from ever getting more than ~1h of churn away from headroom.
 
 set -euo pipefail
 
@@ -31,13 +36,8 @@ cat > "$PLIST" << EOF
         <string>/bin/bash</string>
         <string>${SCRIPT_DST}</string>
     </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>4</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
+    <key>StartInterval</key>
+    <integer>3600</integer>
     <key>StandardOutPath</key>
     <string>${LOG_DIR}/stdout.log</string>
     <key>StandardErrorPath</key>
@@ -49,7 +49,7 @@ cat > "$PLIST" << EOF
 EOF
 
 launchctl load "$PLIST"
-echo "Installed. Job will run daily at 04:00."
+echo "Installed. Job will run hourly."
 echo "Manual trigger: launchctl start $LABEL"
 echo "Logs: $LOG_DIR/"
 echo "Uninstall: launchctl unload $PLIST && rm $PLIST $SCRIPT_DST"

@@ -20,12 +20,14 @@
 # Env overrides:
 #   RUN_LOGS_DIR             default: every ~/.paperclip*/instances/*/data/run-logs
 #   ARCHIVE_DIR              default <run-logs>/../run-logs-archive
-#   RETENTION_DAYS           default 2
+#   RETENTION_DAYS           default 1 (was 2 until AGE-312 stage-3: real ENOSPC recurred
+#                            within 24h of the 2-day-retention fix, so the job now runs
+#                            hourly at 1-day retention to keep ahead of fleet-wide churn)
 #   ARCHIVE_RETENTION_DAYS   default 14
 
 set -euo pipefail
 
-RETENTION_DAYS="${RETENTION_DAYS:-2}"
+RETENTION_DAYS="${RETENTION_DAYS:-1}"
 ARCHIVE_RETENTION_DAYS="${ARCHIVE_RETENTION_DAYS:-14}"
 ARCHIVE_DIR_OVERRIDE="${ARCHIVE_DIR:-}"
 
