@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+#
+# Move cold Pi session files to the external archive volume while leaving
+# absolute symlinks at their original paths. Pi can still resume them whenever
+# the archive SSD is mounted. Hermes uses SQLite for its real conversation
+# history, so its sessions must be exported with Hermes' own CLI before any
+# native prune; never move or symlink a live state.db.
+
+set -uo pipefail
+
+VOLUME="${AGENT_ARCHIVE_VOLUME:-/Volumes/Dzianis-3}"
+ARCHIVE_ROOT="${AGENT_ARCHIVE_ROOT:-$VOLUME/macbook/agents}"
+PI_SESSIONS="${PI_SESSIONS:-$HOME/.pi/agent/sessions}"
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_BIN="${HERMES_BIN:-$HERMES_HOME/hermes-agent/.hermes/bin/hermes}"
+OPENCODE_DB="${OPENCODE_DB:-$HOME/.local/share/opencode/opencode.db}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DAYS=7
+EXECUTE=0
+PI_ONLY=0
+HERMES_ONLY=0
+OPENCODE_ONLY=0
+PRUNE_HERMES=0
+OPTIMIZE_HERMES=0
+HERMES_MAINTENANCE=0
+HERMES_MAINTENANCE_BACKUP=""
+HERMES_MAINTENANCE_RESTORED=1
+REFERENCE_FILE=""
+LOCK_DIR=""
+LOCK_OWNED=0
+RESTORE_OPENCODE=""
+
+usage() {
+  cat <<EOF
+Usage: $0 [--install] [--execute] [--days N] [--pi-only|--hermes-only|--opencode-only] [--restore-opencode FILE] [--prune-hermes] [--optimize-hermes] [--hermes-maintenance] [-h]
+
+  --execute        Move eligible Pi/Hermes snapshot files to the mounted archive SSD.
+                   Default is a read-only report.
+  --install        Install a daily 02:00 user service (macOS launchd or Linux
+                   systemd). Reuses the existing workspace-cleanup job if present.
+                   Set AGENT_ARCHIVE_VOLUME before installation if needed.
+  --days N         Offload files/sessions older than N days (default: 7).
+  --pi-only        Process Pi JSONL sessions only. Used by the daily workspace cleanup.
+  --hermes-only    Process Hermes session-file snapshots only.
+  --opencode-only  Archive OpenCode session families inactive for N days.
+                   Age does not guarantee that an open session is unused.
+                   The database backup contains recent sessions; credential tables
+                   are removed before the backup is written to the archive.
+  --restore-opencode FILE  Restore one session from its JSONL file and manifest.
+  --prune-hermes   Temporarily disabled: Hermes export and prune select different
+                   session sets, so complete export coverage cannot be guaranteed.
+  --optimize-hermes  Run Hermes' native FTS/storage compaction. Requires --execute;
+                   it refuses to rewrite a live database unless paired with --hermes-maintenance.
+  --hermes-maintenance  Stop the default Hermes gateway safely, compact, then restore
+                   the gateway and its healthcheck. Requires --execute --hermes-only
+                   --optimize-hermes. Intended for the nightly maintenance window.
+  -h, --help       Show this help.
+
+Archive layout:
+  $VOLUME/macbook/agents/pi/sessions/...
+  $VOLUME/macbook/agents/hermes/files/...
+  $VOLUME/macbook/agents/hermes/exports/...
+  $VOLUME/macbook/agents/opencode/...
+
+The archive SSD must be mounted and support symbolic links. If absent or
+unsuitable, the script exits with an error without changing local history.
+EOF
+}
+
+log() {
+  printf '%s\n' "$*"
+}
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+restore_hermes_maintenance() {
+  local plist label uid
+  [[ $HERMES_MAINTENANCE_RESTORED -eq 0 ]] || return 0
+  uid="$(id -u)"
+  for plist in "$HERMES_MAINTENANCE_BACKUP"/*.plist; do
+    [[ -e "$plist" ]] || continue
+    mv "$plist" "$HOME/Library/LaunchAgents/$(basename "$plist")" || return 1
+  done
+  for label in ai.hermes.gateway com.agentlabs.hermes-gateway-health; do
+    plist="$HOME/Library/LaunchAgents/$label.plist"
+    [[ -f "$plist" ]] || continue
+    launchctl bootstrap "gui/$uid" "$plist" 2>/dev/null || true
+    launchctl kickstart -k "gui/$uid/$label" 2>/dev/null || true
+  done
+  # `gateway start` is the supported way to ensure the default multiplexed
+  # gateway is actually running after the plist has been restored.
+  [[ -x "$HERMES_BIN" ]] && "$HERMES_BIN" gateway start || true
+  HERMES_MAINTENANCE_RESTORED=1
+}
+
+cleanup() {
+  local rc=$?
+  restore_hermes_maintenance || true
+  [[ -n "$REFERENCE_FILE" ]] && rm -f "$REFERENCE_FILE"
+  [[ $LOCK_OWNED -eq 1 && -n "$LOCK_DIR" ]] && rm -rf "$LOCK_DIR"
+  return "$rc"
+}
+trap cleanup EXIT HUP INT TERM
+
+if [[ "${1:-}" == "--install" ]]; then
+  [[ $# -eq 1 ]] || fail "--install cannot be combined with other options"
+  exec python3 "$SCRIPT_DIR/offload-install.py" "$0"
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --execute) EXECUTE=1; shift ;;
+    --days)
+      [[ $# -ge 2 ]] || fail "--days requires a value"
+      DAYS="$2"
+      shift 2
+      ;;
+    --pi-only) PI_ONLY=1; shift ;;
+    --hermes-only) HERMES_ONLY=1; shift ;;
+    --opencode-only) OPENCODE_ONLY=1; shift ;;
+    --restore-opencode)
+      [[ $# -ge 2 && -n "$2" ]] || fail "--restore-opencode requires a JSONL file"
+      RESTORE_OPENCODE="$2"; shift 2 ;;
+    --prune-hermes) PRUNE_HERMES=1; shift ;;
+    --optimize-hermes) OPTIMIZE_HERMES=1; shift ;;
+    --hermes-maintenance) HERMES_MAINTENANCE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) fail "unknown argument '$1'" ;;
+  esac
+done
+
+[[ "$DAYS" =~ ^[0-9]+$ ]] && [[ "$DAYS" -gt 0 ]] || fail "--days must be a positive integer"
+[[ $((PI_ONLY + HERMES_ONLY + OPENCODE_ONLY)) -lt 2 ]] || fail "only one --*-only option may be specified"
+[[ $OPENCODE_ONLY -eq 0 || $((PRUNE_HERMES + OPTIMIZE_HERMES + HERMES_MAINTENANCE)) -eq 0 ]] || fail "--opencode-only cannot be combined with Hermes maintenance"
+[[ $PRUNE_HERMES -eq 0 || $EXECUTE -eq 1 ]] || fail "--prune-hermes requires --execute"
+[[ $PRUNE_HERMES -eq 0 || $PI_ONLY -eq 0 ]] || fail "--prune-hermes cannot be combined with --pi-only"
+[[ $OPTIMIZE_HERMES -eq 0 || $EXECUTE -eq 1 ]] || fail "--optimize-hermes requires --execute"
+[[ $HERMES_MAINTENANCE -eq 0 || $EXECUTE -eq 1 ]] || fail "--hermes-maintenance requires --execute"
+[[ $HERMES_MAINTENANCE -eq 0 || $HERMES_ONLY -eq 1 ]] || fail "--hermes-maintenance requires --hermes-only"
+[[ $HERMES_MAINTENANCE -eq 0 || $OPTIMIZE_HERMES -eq 1 ]] || fail "--hermes-maintenance requires --optimize-hermes"
+[[ $PRUNE_HERMES -eq 0 ]] || fail "--prune-hermes disabled: export coverage of the prune set cannot be guaranteed; no changes made"
+[[ -z "$RESTORE_OPENCODE" || $((EXECUTE + PI_ONLY + HERMES_ONLY + OPENCODE_ONLY + OPTIMIZE_HERMES + HERMES_MAINTENANCE)) -eq 0 ]] || fail "--restore-opencode cannot be combined with offload options"
+
+LOCK_DIR="${TMPDIR:-/tmp}/agent-history-offload-${USER:-$(id -u)}.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  existing_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" 2>/dev/null; then
+    fail "another offload run is active (pid $existing_pid)"
+  fi
+  rm -rf "$LOCK_DIR"
+  mkdir "$LOCK_DIR" || fail "could not acquire offload lock"
+fi
+LOCK_OWNED=1
+printf '%s\n' "$$" > "$LOCK_DIR/pid"
+
+if [[ -n "$RESTORE_OPENCODE" ]]; then
+  python3 "$SCRIPT_DIR/offload-opencode.py" --db "$OPENCODE_DB" --restore "$RESTORE_OPENCODE"
+  exit $?
+fi
+
+# Do not mkdir this path: that would silently create a local directory when the
+# SSD is absent. A mounted filesystem is mandatory before any mutation.
+if command -v mountpoint >/dev/null 2>&1; then
+  mountpoint -q -- "$VOLUME" && volume_mounted=1 || volume_mounted=0
+else
+  python3 -c 'import os,sys; sys.exit(0 if os.path.ismount(sys.argv[1]) else 1)' "$VOLUME" && volume_mounted=1 || volume_mounted=0
+fi
+if [[ "$volume_mounted" -eq 0 ]]; then
+  fail "Archive volume is not mounted at $VOLUME; skipped without changes."
+fi
+[[ -d "$VOLUME" ]] || fail "archive mount point is not a directory: $VOLUME"
+
+mkdir -p "$ARCHIVE_ROOT" || fail "could not create archive root: $ARCHIVE_ROOT"
+probe="$ARCHIVE_ROOT/.symlink-probe-$$"
+if ! ln -s "$probe.target" "$probe" 2>/dev/null || [[ ! -L "$probe" ]]; then
+  rm -f "$probe"
+  fail "archive volume does not support symbolic links; refusing to break resumable history"
+fi
+rm -f "$probe"
+
+now="$(date +%s)"
+cutoff=$((now - DAYS * 86400))
+REFERENCE_FILE="$(mktemp "${TMPDIR:-/tmp}/agent-history-cutoff.XXXXXX")" || fail "could not create cutoff reference"
+if date -r "$cutoff" '+%Y%m%d%H%M.%S' >/dev/null 2>&1; then
+  touch -t "$(date -r "$cutoff" '+%Y%m%d%H%M.%S')" "$REFERENCE_FILE"
+else
+  touch -d "@$cutoff" "$REFERENCE_FILE" || fail "could not set cutoff timestamp"
+fi
+
+offloaded_count=0
+skipped_changed=0
+failed_count=0
+
+# Copy a frozen list in one rsync, checksum-verify that batch, then replace its
+# local paths with absolute symlinks. The earlier per-file method was safe but
+# launched tens of thousands of rsync/lsof processes and never completed.
+offload_tree() {
+  local source_root="$1" archive_root="$2" category="$3"
+  local file list_file verification_file relative source destination candidate_count
+  [[ -d "$source_root" ]] || return 0
+
+  list_file="$(mktemp "${TMPDIR:-/tmp}/agent-history-files.XXXXXX")" || {
+    log "  ! failed ($category): could not create file list"
+    failed_count=$((failed_count + 1))
+    return 1
+  }
+  verification_file="$(mktemp "${TMPDIR:-/tmp}/agent-history-verify.XXXXXX")" || {
+    rm -f "$list_file"
+    log "  ! failed ($category): could not create verification file"
+    failed_count=$((failed_count + 1))
+    return 1
+  }
+
+  # Snapshot before mutation: a directory traversal can otherwise skip entries
+  # as files are replaced with symlinks.
+  (cd "$source_root" && find . -type f ! -newer "$REFERENCE_FILE" -print0) > "$list_file" 2>/dev/null
+  candidate_count="$(tr -cd '\000' < "$list_file" | wc -c | tr -d ' ')"
+  if [[ "$candidate_count" -eq 0 ]]; then
+    rm -f "$list_file" "$verification_file"
+    return 0
+  fi
+  if [[ $EXECUTE -eq 0 ]]; then
+    log "  [dry-run] would offload $candidate_count $category file(s)"
+    rm -f "$list_file" "$verification_file"
+    return 0
+  fi
+
+  mkdir -p "$archive_root" || {
+    rm -f "$list_file" "$verification_file"
+    log "  ! failed ($category): could not create archive root"
+    failed_count=$((failed_count + 1))
+    return 1
+  }
+  if ! rsync -a --from0 --files-from="$list_file" "$source_root/" "$archive_root/"; then
+    rm -f "$list_file" "$verification_file"
+    log "  ! failed ($category): batch copy failed; local files were retained"
+    failed_count=$((failed_count + 1))
+    return 1
+  fi
+  if ! rsync -acn --from0 --files-from="$list_file" "$source_root/" "$archive_root/" > "$verification_file"; then
+    rm -f "$list_file" "$verification_file"
+    log "  ! failed ($category): checksum verification failed; local files were retained"
+    failed_count=$((failed_count + 1))
+    return 1
+  fi
+  if [[ -s "$verification_file" ]]; then
+    head -10 "$verification_file" >&2
+    rm -f "$list_file" "$verification_file"
+    log "  ! failed ($category): archive differs after verification; local files were retained"
+    failed_count=$((failed_count + 1))
+    return 1
+  fi
+
+  while IFS= read -r -d '' file; do
+    relative="${file#./}"
+    source="$source_root/$relative"
+    destination="$archive_root/$relative"
+    # A writer racing this batch changes mtime and remains local for next run.
+    if [[ ! -f "$source" || -L "$source" ]]; then
+      continue
+    fi
+    if [[ "$source" -nt "$REFERENCE_FILE" ]]; then
+      skipped_changed=$((skipped_changed + 1))
+      continue
+    fi
+    if [[ ! -f "$destination" ]]; then
+      log "  ! failed ($category): verified destination disappeared: $relative"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+    if ! rm "$source" || ! ln -s "$destination" "$source"; then
+      log "  ! failed ($category): local link replacement failed: $relative"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+    offloaded_count=$((offloaded_count + 1))
+  done < "$list_file"
+
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$category" \
+    "$candidate_count" "$source_root" "$archive_root" >> "$ARCHIVE_ROOT/offload-manifest.tsv"
+  rm -f "$list_file" "$verification_file"
+}
+
+offload_pi() {
+  [[ -d "$PI_SESSIONS" ]] || {
+    log "Pi session directory missing: $PI_SESSIONS"
+    return 0
+  }
+  log "Pi sessions older than $DAYS day(s):"
+  offload_tree "$PI_SESSIONS" "$ARCHIVE_ROOT/pi/sessions" "pi-session"
+}
+
+offload_hermes_session_files() {
+  local profile_dir
+  [[ -d "$HERMES_HOME" ]] || {
+    log "Hermes home missing: $HERMES_HOME"
+    return 0
+  }
+  log "Hermes session-file snapshots older than $DAYS day(s):"
+  offload_tree "$HERMES_HOME/sessions" "$ARCHIVE_ROOT/hermes/files/sessions" "hermes-session-file"
+  offload_tree "$HERMES_HOME/.supervisor/sessions" "$ARCHIVE_ROOT/hermes/files/.supervisor/sessions" "hermes-supervisor-session-file"
+  for profile_dir in "$HERMES_HOME"/profiles/*; do
+    [[ -d "$profile_dir/sessions" ]] || continue
+    offload_tree "$profile_dir/sessions" "$ARCHIVE_ROOT/hermes/files/profiles/$(basename "$profile_dir")/sessions" "hermes-profile-session-file"
+  done
+}
+
+# Hermes conversations live in profile state.db (SQLite), not the request-dump
+# files above. Export with the supported CLI before its supported native prune;
+# do not copy, symlink, or edit a live state.db directly.
+export_and_prune_hermes() {
+  local profile_dir profile export_dir export_file before_size after_size
+  [[ -x "$HERMES_BIN" ]] || fail "Hermes CLI not found: $HERMES_BIN"
+
+  for profile_dir in "$HERMES_HOME" "$HERMES_HOME"/profiles/*; do
+    [[ -f "$profile_dir/config.yaml" && -f "$profile_dir/state.db" ]] || continue
+    if [[ "$profile_dir" == "$HERMES_HOME" ]]; then
+      profile="default"
+    else
+      profile="$(basename "$profile_dir")"
+    fi
+    export_dir="$ARCHIVE_ROOT/hermes/exports/$profile"
+    mkdir -p "$export_dir" || fail "could not create Hermes export directory"
+    export_file="$export_dir/sessions-older-than-${DAYS}d-$(date -u '+%Y%m%dT%H%M%SZ').jsonl"
+
+    log "Exporting Hermes profile '$profile' sessions older than $DAYS day(s)"
+    if [[ "$profile" == "default" ]]; then
+      "$HERMES_BIN" sessions export "$export_file" --format jsonl --older-than "${DAYS}d" --redact --yes ||
+        fail "Hermes export failed for profile '$profile'; no pruning was attempted"
+    else
+      "$HERMES_BIN" --profile "$profile" sessions export "$export_file" --format jsonl --older-than "${DAYS}d" --redact --yes ||
+        fail "Hermes export failed for profile '$profile'; no pruning was attempted"
+    fi
+    [[ -s "$export_file" ]] || {
+      rm -f "$export_file"
+      log "  * no matching Hermes sessions for '$profile'"
+      continue
+    }
+    shasum -a 256 "$export_file" > "$export_file.sha256" || fail "could not checksum $export_file"
+    before_size="$(stat -f %z "$profile_dir/state.db" 2>/dev/null || stat -c %s "$profile_dir/state.db")"
+
+    log "  * verified export; pruning through Hermes' live-owner path"
+    if [[ "$profile" == "default" ]]; then
+      "$HERMES_BIN" sessions prune --older-than "${DAYS}d" --yes ||
+        fail "Hermes prune failed for '$profile'; export remains at $export_file"
+    else
+      "$HERMES_BIN" --profile "$profile" sessions prune --older-than "${DAYS}d" --yes ||
+        fail "Hermes prune failed for '$profile'; export remains at $export_file"
+    fi
+    after_size="$(stat -f %z "$profile_dir/state.db" 2>/dev/null || stat -c %s "$profile_dir/state.db")"
+    log "  * '$profile' pruned; state.db bytes before=$before_size after=$after_size (VACUUM is separate)"
+  done
+}
+
+# Uses Hermes' supported storage compactor without --force. It refuses rather
+# than rewriting through an unsafe live holder; that is the required behavior.
+optimize_hermes_storage() {
+  local profile_dir profile
+  [[ -x "$HERMES_BIN" ]] || fail "Hermes CLI not found: $HERMES_BIN"
+  for profile_dir in "$HERMES_HOME" "$HERMES_HOME"/profiles/*; do
+    [[ -f "$profile_dir/config.yaml" && -f "$profile_dir/state.db" ]] || continue
+    if [[ "$profile_dir" == "$HERMES_HOME" ]]; then
+      profile="default"
+      log "Optimizing Hermes profile '$profile' state.db"
+      "$HERMES_BIN" sessions optimize-storage --yes ||
+        fail "Hermes storage optimization failed for '$profile'; no forced rewrite was attempted"
+    else
+      profile="$(basename "$profile_dir")"
+      log "Optimizing Hermes profile '$profile' state.db"
+      "$HERMES_BIN" --profile "$profile" sessions optimize-storage --yes ||
+        fail "Hermes storage optimization failed for '$profile'; no forced rewrite was attempted"
+    fi
+  done
+}
+
+begin_hermes_maintenance() {
+  local uid label plist holders attempt moved=0
+  [[ -x "$HERMES_BIN" ]] || fail "Hermes CLI not found: $HERMES_BIN"
+  command -v lsof >/dev/null 2>&1 || fail "lsof is required to verify Hermes SQLite is idle"
+
+  HERMES_MAINTENANCE_BACKUP="$HERMES_HOME/backups/storage-maintenance-$(date +%Y%m%dT%H%M%S)/LaunchAgents"
+  mkdir -p "$HERMES_MAINTENANCE_BACKUP" || fail "could not create Hermes maintenance backup"
+  for label in ai.hermes.gateway com.agentlabs.hermes-gateway-health; do
+    plist="$HOME/Library/LaunchAgents/$label.plist"
+    [[ -f "$plist" ]] || continue
+    mv "$plist" "$HERMES_MAINTENANCE_BACKUP/$label.plist" || fail "could not stage $label plist"
+    HERMES_MAINTENANCE_RESTORED=0
+    moved=1
+  done
+  [[ $moved -eq 1 ]] || fail "no Hermes gateway/healthcheck plist found; refusing unmanaged maintenance"
+
+  # Removing plists first prevents the healthcheck from reviving the gateway
+  # during the maintenance window. Do not use --force against a live SQLite DB.
+  uid="$(id -u)"
+  for label in ai.hermes.gateway com.agentlabs.hermes-gateway-health; do
+    launchctl bootout "gui/$uid/$label" 2>/dev/null || true
+  done
+  holders="pending"
+  for attempt in $(seq 1 90); do
+    holders="$(for plist in "$HERMES_HOME/state.db" "$HERMES_HOME"/profiles/*/state.db; do
+      [[ -f "$plist" ]] && lsof -t "$plist" 2>/dev/null || true
+    done | sort -u)"
+    [[ -z "$holders" ]] && break
+    sleep 1
+  done
+  [[ -z "$holders" ]] || fail "Hermes SQLite writers did not stop: $holders"
+  log "Hermes gateway stopped; beginning native compaction."
+}
+
+log "Agent-history offload: mode=$([[ $EXECUTE -eq 1 ]] && echo EXECUTE || echo DRY-RUN), days=$DAYS, target=$ARCHIVE_ROOT"
+if [[ $HERMES_MAINTENANCE -eq 1 ]]; then
+  begin_hermes_maintenance
+fi
+if [[ $HERMES_ONLY -eq 0 && $OPENCODE_ONLY -eq 0 ]]; then
+  offload_pi
+fi
+if [[ $PI_ONLY -eq 0 && $OPENCODE_ONLY -eq 0 ]]; then
+  offload_hermes_session_files
+fi
+if [[ $PI_ONLY -eq 0 && $HERMES_ONLY -eq 0 ]]; then
+  opencode_args=(--db "$OPENCODE_DB" --archive "$ARCHIVE_ROOT/opencode" --days "$DAYS")
+  [[ $EXECUTE -eq 0 ]] || opencode_args+=(--execute)
+  if ! python3 "$SCRIPT_DIR/offload-opencode.py" "${opencode_args[@]}"; then
+    failed_count=$((failed_count + 1))
+  fi
+fi
+if [[ $PRUNE_HERMES -eq 1 ]]; then
+  export_and_prune_hermes
+fi
+if [[ $OPTIMIZE_HERMES -eq 1 ]]; then
+  optimize_hermes_storage
+fi
+if [[ $HERMES_MAINTENANCE -eq 1 ]]; then
+  restore_hermes_maintenance || fail "Hermes compaction completed, but gateway restoration failed"
+fi
+
+log "Done. offloaded=$offloaded_count files, changed-during-run=$skipped_changed, failed=$failed_count"
+[[ $failed_count -eq 0 ]] || exit 1
